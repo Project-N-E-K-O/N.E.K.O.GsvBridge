@@ -10,7 +10,15 @@ GPT-SoVITS API v3 - FastAPI 后端服务
 """
 
 import sys
+import mimetypes
 from pathlib import Path
+
+# Windows registry MIME overrides can make module scripts serve as text/plain,
+# which causes browsers to reject the Nuxt frontend. Keep static asset types
+# deterministic within this process instead of depending on machine settings.
+mimetypes.add_type("application/javascript", ".js", strict=True)
+mimetypes.add_type("application/javascript", ".mjs", strict=True)
+mimetypes.add_type("text/css", ".css", strict=True)
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
