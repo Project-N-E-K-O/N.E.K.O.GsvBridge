@@ -170,6 +170,7 @@ _FRONTEND_MEDIA_TYPES = {
     ".js": "text/javascript",
     ".json": "application/json",
     ".mjs": "text/javascript",
+    ".svg": "image/svg+xml",
     ".txt": "text/plain",
     ".wasm": "application/wasm",
 }

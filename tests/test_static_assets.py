@@ -30,6 +30,7 @@ class StaticAssetTests(TestCase):
             ".json": "application/json",
             ".txt": "text/plain",
             ".ico": "image/x-icon",
+            ".svg": "image/svg+xml",
             ".wasm": "application/wasm",
         }
         for suffix, media_type in expected.items():
