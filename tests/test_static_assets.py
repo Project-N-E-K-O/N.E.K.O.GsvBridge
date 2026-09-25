@@ -8,7 +8,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from api_neko.frontend_app import FRONTEND_MEDIA_TYPES, FrontendStaticFiles, frontend_media_type
+from api_neko.frontend_app import FRONTEND_MEDIA_TYPES, FrontendApp, frontend_media_type
 
 
 class StaticAssetTests(TestCase):
@@ -36,7 +36,7 @@ class StaticAssetTests(TestCase):
                     Route("/api/v3/health", lambda request: JSONResponse({"ok": True}))
                 ]
             )
-            app.mount("/", FrontendStaticFiles(directory=root, html=True), name="frontend")
+            app.mount("/", FrontendApp(directory=root), name="frontend")
             with TestClient(app, raise_server_exceptions=False) as client:
                 self.assertEqual(
                     client.get("/app.js").headers["content-type"],
@@ -48,6 +48,8 @@ class StaticAssetTests(TestCase):
                 )
                 self.assertEqual(client.get("/api/v3/health").status_code, 200)
                 self.assertEqual(client.get("/config/new").status_code, 200)
+                self.assertEqual(client.get("/config/example").status_code, 200)
+                self.assertEqual(client.get("/unknown-page").status_code, 404)
                 self.assertEqual(client.get("/missing.js").status_code, 404)
                 self.assertEqual(client.get("/favicon.ico").status_code, 404)
                 self.assertEqual(client.get("/api/v3/unknown").status_code, 404)
@@ -64,7 +66,7 @@ class StaticAssetTests(TestCase):
                 root = Path(temp_dir)
                 (root / "app.js").write_text("console.log('ok');", encoding="utf-8")
                 app = Starlette()
-                app.mount("/", FrontendStaticFiles(directory=root), name="frontend")
+                app.mount("/", FrontendApp(directory=root), name="frontend")
                 with TestClient(app) as client:
                     self.assertEqual(
                         client.get("/app.js").headers["content-type"],

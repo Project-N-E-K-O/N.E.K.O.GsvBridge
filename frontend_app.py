@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import mimetypes
-import stat
 from pathlib import Path
 
-import anyio
-from starlette.datastructures import Headers
-from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse
-from starlette.staticfiles import NotModifiedResponse, StaticFiles
+from starlette.responses import FileResponse, PlainTextResponse
+from starlette.staticfiles import StaticFiles
 
 
 FRONTEND_MEDIA_TYPES = {
@@ -44,8 +40,29 @@ def frontend_media_type(path: str | Path) -> str:
     return _STANDARD_MEDIA_TYPES.guess_type(str(path))[0] or "application/octet-stream"
 
 
-class FrontendStaticFiles(StaticFiles):
-    """Serve frontend files and narrowly scoped extensionless SPA routes."""
+def _content_type_header(path: str) -> str:
+    media_type = frontend_media_type(path)
+    return f"{media_type}; charset=utf-8" if media_type.startswith("text/") else media_type
+
+
+def _is_client_route(path: str) -> bool:
+    """The generated build leaves only config detail pages to the client router."""
+    parts = path.strip("/").split("/")
+    return (
+        len(parts) == 2
+        and parts[0] == "config"
+        and parts[1] not in ("", ".", "..")
+        and "\x00" not in parts[1]
+        and not Path(parts[1]).suffix
+    )
+
+
+class FrontendApp:
+    """ASGI frontend host composed around Starlette's path-safe StaticFiles."""
+
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory)
+        self.static = StaticFiles(directory=self.directory, html=True)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "websocket":
@@ -53,48 +70,45 @@ class FrontendStaticFiles(StaticFiles):
             return
         if scope["type"] != "http":
             return
-        await super().__call__(scope, receive, send)
 
-    def file_response(self, full_path, stat_result, scope, status_code=200):
-        request_headers = Headers(scope=scope)
-        response = FileResponse(
-            full_path,
-            status_code=status_code,
-            stat_result=stat_result,
-            media_type=frontend_media_type(full_path),
-        )
-        if self.is_not_modified(response.headers, request_headers):
-            return NotModifiedResponse(response.headers)
-        return response
+        request_path = scope.get("path", "")
+        normalized_path = request_path.lstrip("/")
+        if normalized_path == "api" or normalized_path.startswith("api/"):
+            await PlainTextResponse("Not Found", status_code=404)(scope, receive, send)
+            return
 
-    async def get_response(self, path: str, scope):
-        """Use StaticFiles for file safety, then fallback only for page routes."""
-        normalized_path = path.lstrip("/")
-        scope_path = scope.get("path", "").lstrip("/")
-        if (
-            normalized_path == "api"
-            or normalized_path.startswith("api/")
-            or scope_path == "api"
-            or scope_path.startswith("api/")
-        ):
-            raise HTTPException(status_code=404)
+        extension = Path(request_path).suffix
+        fallback_sent = False
+
+        async def send_response(message):
+            nonlocal fallback_sent
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                if status == 404 and _is_client_route(request_path):
+                    fallback = self.directory / "200.html"
+                    if fallback.is_file():
+                        fallback_sent = True
+                        await FileResponse(fallback, media_type="text/html")(
+                            scope, receive, send
+                        )
+                        return
+
+                if status in (200, 206, 304) and extension:
+                    headers = [
+                        (name, value)
+                        for name, value in message["headers"]
+                        if name.lower() != b"content-type"
+                    ]
+                    headers.append(
+                        (b"content-type", _content_type_header(request_path).encode())
+                    )
+                    message = {**message, "headers": headers}
+
+            if not fallback_sent:
+                await send(message)
 
         try:
-            response = await super().get_response(path, scope)
-        except (ValueError, OSError) as exc:
-            # Starlette normally converts malformed filesystem paths to 404;
-            # keep the same contract for platform-specific path errors.
-            raise HTTPException(status_code=404) from exc
-
-        if response.status_code != 404 or Path(path).suffix:
-            return response
-
-        # Nuxt emits 200.html for client-side routes. This branch never uses
-        # user input as a filesystem path, so StaticFiles retains path safety.
-        fallback_name = "200.html" if self.html else "index.html"
-        full_path, stat_result = await anyio.to_thread.run_sync(
-            self.lookup_path, fallback_name
-        )
-        if stat_result is not None and stat.S_ISREG(stat_result.st_mode):
-            return self.file_response(full_path, stat_result, scope)
-        raise HTTPException(status_code=404)
+            await self.static(scope, receive, send_response)
+        except (ValueError, OSError):
+            if not fallback_sent:
+                await PlainTextResponse("Not Found", status_code=404)(scope, receive, send)

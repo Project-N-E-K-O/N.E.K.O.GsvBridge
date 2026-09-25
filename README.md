@@ -218,4 +218,4 @@ media_type = "wav"
 
 ### 前端托管
 
-`server.py` 将 `frontend/.output/public` 挂载为独立的前端静态应用：真实静态资源由 Starlette 安全托管，只有无扩展名的客户端页面路由使用 Nuxt 的 `200.html` fallback；缺失资源和未知 `/api` 路径返回 404。若该目录不存在，启动时会打印警告，需先在 `frontend/` 下执行 `npx nuxt generate` 构建。
+`server.py` 将 `frontend/.output/public` 挂载为独立的前端应用。真实文件由 Starlette 的 `StaticFiles` 托管，只有构建产物未预渲染的 `/config/new` 和 `/config/{id}` 页面使用 Nuxt 的 `200.html`。缺失资源、未知页面和未知 `/api` 路径返回 404。资源 MIME 在 ASGI 响应头处固定，不依赖 Windows 注册表。若该目录不存在，启动时会打印警告，需先在 `frontend/` 下执行 `npx nuxt generate` 构建。

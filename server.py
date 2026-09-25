@@ -28,7 +28,7 @@ from api_neko.routers.config import router as config_router
 from api_neko.routers.health import router as health_router
 from api_neko.routers.tts import router as tts_router
 from api_neko.routers.tts_v3 import router as tts_v3_router
-from api_neko.frontend_app import FrontendStaticFiles
+from api_neko.frontend_app import FrontendApp
 
 
 # ─── TTS Pipeline 初始化 ───
@@ -164,7 +164,7 @@ if _FRONTEND_DIST.is_dir():
     # files and client-side page routes with one path-safe implementation.
     app.mount(
         "/",
-        FrontendStaticFiles(directory=_FRONTEND_DIST, html=True),
+        FrontendApp(directory=_FRONTEND_DIST),
         name="frontend",
     )
 else:
