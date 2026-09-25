@@ -10,15 +10,10 @@ GPT-SoVITS API v3 - FastAPI 后端服务
 """
 
 import sys
-import mimetypes
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from starlette.datastructures import Headers
-from starlette.staticfiles import NotModifiedResponse
 
 # 路径初始化：从 config.py 集中管理的路径配置中获取
 from api_neko.config import PROJECT_ROOT, GSV_PACKAGE_DIR
@@ -33,6 +28,7 @@ from api_neko.routers.config import router as config_router
 from api_neko.routers.health import router as health_router
 from api_neko.routers.tts import router as tts_router
 from api_neko.routers.tts_v3 import router as tts_v3_router
+from api_neko.frontend_app import FrontendStaticFiles
 
 
 # ─── TTS Pipeline 初始化 ───
@@ -163,76 +159,14 @@ app.include_router(tts_v3_router)
 # ─── 挂载前端静态文件 ───
 _FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / ".output" / "public"
 
-_FRONTEND_MEDIA_TYPES = {
-    ".css": "text/css",
-    ".html": "text/html",
-    ".ico": "image/x-icon",
-    ".js": "text/javascript",
-    ".json": "application/json",
-    ".mjs": "text/javascript",
-    ".svg": "image/svg+xml",
-    ".txt": "text/plain",
-    ".wasm": "application/wasm",
-}
-
-
-def _frontend_media_type(path) -> str:
-    """Return a deterministic media type for a generated frontend asset."""
-    suffix = Path(path).suffix.lower()
-    if suffix in _FRONTEND_MEDIA_TYPES:
-        return _FRONTEND_MEDIA_TYPES[suffix]
-    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-
-
-class FrontendStaticFiles(StaticFiles):
-    """Serve generated frontend files without consulting Windows MIME registry."""
-
-    def file_response(self, full_path, stat_result, scope, status_code=200):
-        request_headers = Headers(scope=scope)
-        response = FileResponse(
-            full_path,
-            status_code=status_code,
-            stat_result=stat_result,
-            media_type=_frontend_media_type(full_path),
-        )
-        if self.is_not_modified(response.headers, request_headers):
-            return NotModifiedResponse(response.headers)
-        return response
-
-
-def _resolve_frontend_path(relative_path: str) -> Path:
-    """Resolve a frontend URL and reject paths outside the dist root."""
-    frontend_root = _FRONTEND_DIST.resolve()
-    candidate = (frontend_root / relative_path).resolve()
-    try:
-        candidate.relative_to(frontend_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=404) from exc
-    return candidate
-
 if _FRONTEND_DIST.is_dir():
-    # 挂载 _nuxt/ 等静态资源（带缓存）
-    app.mount("/_nuxt", FrontendStaticFiles(directory=_FRONTEND_DIST / "_nuxt"), name="nuxt-assets")
-    # 挂载 public 根目录下的静态文件（favicon.ico, robots.txt 等）
-    app.mount("/static-root", FrontendStaticFiles(directory=_FRONTEND_DIST), name="static-root")
-
-    @app.get("/favicon.ico")
-    async def favicon():
-        return FileResponse(_FRONTEND_DIST / "favicon.ico", media_type="image/x-icon")
-
-    @app.get("/{full_path:path}")
-    async def spa_fallback(request: Request, full_path: str):
-        """SPA fallback: 非 API 路径都返回 index.html，由 Nuxt 客户端路由处理"""
-        # 尝试精确匹配静态文件（如 /tts/index.html）
-        file_path = _resolve_frontend_path(full_path)
-        if file_path.is_file():
-            return FileResponse(file_path, media_type=_frontend_media_type(file_path))
-        # 尝试目录下的 index.html（如 /tts -> /tts/index.html）
-        index_path = file_path / "index.html"
-        if index_path.is_file():
-            return FileResponse(index_path, media_type="text/html")
-        # 兜底返回根 index.html（SPA 客户端路由）
-        return FileResponse(_FRONTEND_DIST / "index.html", media_type="text/html")
+    # API routers are registered above; the root mount handles all frontend
+    # files and client-side page routes with one path-safe implementation.
+    app.mount(
+        "/",
+        FrontendStaticFiles(directory=_FRONTEND_DIST, html=True),
+        name="frontend",
+    )
 else:
     print(f"[warning] 前端静态文件目录不存在: {_FRONTEND_DIST}")
     print(f"[warning] 请先在 api_neko/frontend/ 下执行 npx nuxt generate 构建前端")

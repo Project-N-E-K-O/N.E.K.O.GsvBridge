@@ -218,4 +218,4 @@ media_type = "wav"
 
 ### 前端托管
 
-`server.py` 自动挂载 `frontend/.output/public` 下的 Nuxt 静态构建产物，并以 SPA fallback 方式处理客户端路由。若该目录不存在，启动时会打印警告，需先在 `frontend/` 下执行 `npx nuxt generate` 构建。
+`server.py` 将 `frontend/.output/public` 挂载为独立的前端静态应用：真实静态资源由 Starlette 安全托管，只有无扩展名的客户端页面路由使用 Nuxt 的 `200.html` fallback；缺失资源和未知 `/api` 路径返回 404。若该目录不存在，启动时会打印警告，需先在 `frontend/` 下执行 `npx nuxt generate` 构建。
