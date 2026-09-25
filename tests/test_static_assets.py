@@ -1,6 +1,11 @@
 import tempfile
 from pathlib import Path
+import sys
 from unittest import TestCase
+
+PROJECT_PARENT = Path(__file__).resolve().parents[2]
+if str(PROJECT_PARENT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_PARENT))
 
 from fastapi import HTTPException
 from starlette.applications import Starlette
