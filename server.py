@@ -10,6 +10,7 @@ GPT-SoVITS API v3 - FastAPI 后端服务
 """
 
 import sys
+import mimetypes
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -170,12 +171,16 @@ _FRONTEND_MEDIA_TYPES = {
     ".json": "application/json",
     ".mjs": "text/javascript",
     ".txt": "text/plain",
+    ".wasm": "application/wasm",
 }
 
 
 def _frontend_media_type(path) -> str:
     """Return a deterministic media type for a generated frontend asset."""
-    return _FRONTEND_MEDIA_TYPES.get(Path(path).suffix.lower(), "application/octet-stream")
+    suffix = Path(path).suffix.lower()
+    if suffix in _FRONTEND_MEDIA_TYPES:
+        return _FRONTEND_MEDIA_TYPES[suffix]
+    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
 
 class FrontendStaticFiles(StaticFiles):

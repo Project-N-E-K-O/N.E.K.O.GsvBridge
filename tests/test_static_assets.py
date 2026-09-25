@@ -1,15 +1,21 @@
+import importlib.util
+import sys
 import tempfile
 from pathlib import Path
-import sys
 from unittest import TestCase
-
-PROJECT_PARENT = Path(__file__).resolve().parents[2]
-if str(PROJECT_PARENT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_PARENT))
 
 from fastapi import HTTPException
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
+
+# The repository is deployed as api_neko but can have any checkout directory name.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "api_neko", REPO_ROOT / "__init__.py", submodule_search_locations=[str(REPO_ROOT)]
+)
+api_neko = importlib.util.module_from_spec(spec)
+sys.modules["api_neko"] = api_neko
+spec.loader.exec_module(api_neko)
 
 from api_neko.server import FrontendStaticFiles, _frontend_media_type, _resolve_frontend_path
 
@@ -24,10 +30,15 @@ class StaticAssetTests(TestCase):
             ".json": "application/json",
             ".txt": "text/plain",
             ".ico": "image/x-icon",
+            ".wasm": "application/wasm",
         }
         for suffix, media_type in expected.items():
             with self.subTest(suffix=suffix):
                 self.assertEqual(_frontend_media_type("asset" + suffix), media_type)
+
+    def test_other_known_media_types_keep_standard_detection(self):
+        self.assertEqual(_frontend_media_type("image.svg"), "image/svg+xml")
+        self.assertEqual(_frontend_media_type("unknown.nekoasset"), "application/octet-stream")
 
     def test_static_mount_uses_explicit_media_types(self):
         with tempfile.TemporaryDirectory() as temp_dir:
