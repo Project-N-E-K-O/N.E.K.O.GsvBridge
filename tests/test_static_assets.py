@@ -1,3 +1,4 @@
+import mimetypes
 import tempfile
 from pathlib import Path
 from unittest import TestCase
@@ -51,4 +52,26 @@ class StaticAssetTests(TestCase):
                 self.assertEqual(client.get("/favicon.ico").status_code, 404)
                 self.assertEqual(client.get("/api/v3/unknown").status_code, 404)
                 self.assertEqual(client.get("/api/unknown").status_code, 404)
-                self.assertEqual(client.get("/a%00b").status_code, 404)
+                for path in ("/..%2Fserver.py", "/%2e%2e/server.py", "/a%00b"):
+                    with self.subTest(path=path):
+                        self.assertEqual(client.get(path).status_code, 404)
+
+    def test_static_response_is_not_affected_by_global_registry_mapping(self):
+        previous = mimetypes.types_map.get(".js")
+        mimetypes.types_map[".js"] = "text/plain"
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "app.js").write_text("console.log('ok');", encoding="utf-8")
+                app = Starlette()
+                app.mount("/", FrontendStaticFiles(directory=root), name="frontend")
+                with TestClient(app) as client:
+                    self.assertEqual(
+                        client.get("/app.js").headers["content-type"],
+                        "text/javascript; charset=utf-8",
+                    )
+        finally:
+            if previous is None:
+                mimetypes.types_map.pop(".js", None)
+            else:
+                mimetypes.types_map[".js"] = previous
