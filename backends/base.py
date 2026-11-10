@@ -78,3 +78,6 @@ class BasePipeline(ABC):
         if not req.get("ref_audio_path"):
             return "ref_audio_path is required"
         return None
+
+    def stop(self) -> None:
+        """Request cooperative cancellation of the active call, when supported."""

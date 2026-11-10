@@ -42,7 +42,10 @@ class TTS_Request(BaseModel):
     streaming_mode: Union[bool, int] = False
     parallel_infer: bool = True
     repetition_penalty: float = 1.35
-    sample_steps: int = 32
+    sample_steps: Union[int, None] = None
+    cfg_rate: Union[float, None] = None
+    use_cuda_graph: bool = True
+    use_flash_attention: bool = True
     super_sampling: bool = False
     overlap_length: int = 2
     min_chunk_length: int = 16
@@ -154,7 +157,10 @@ async def tts_get_endpoint(
     media_type: str = "wav",
     parallel_infer: bool = True,
     repetition_penalty: float = 1.35,
-    sample_steps: int = 32,
+    sample_steps: Union[int, None] = None,
+    cfg_rate: Union[float, None] = None,
+    use_cuda_graph: bool = True,
+    use_flash_attention: bool = True,
     super_sampling: bool = False,
     streaming_mode: Union[bool, int] = False,
     overlap_length: int = 2,
@@ -181,7 +187,10 @@ async def tts_get_endpoint(
         "streaming_mode": streaming_mode,
         "parallel_infer": parallel_infer,
         "repetition_penalty": float(repetition_penalty),
-        "sample_steps": int(sample_steps),
+        "sample_steps": sample_steps,
+        "cfg_rate": cfg_rate,
+        "use_cuda_graph": use_cuda_graph,
+        "use_flash_attention": use_flash_attention,
         "super_sampling": super_sampling,
         "overlap_length": int(overlap_length),
         "min_chunk_length": int(min_chunk_length),
@@ -191,7 +200,7 @@ async def tts_get_endpoint(
 
 @router.post("/tts", summary="TTS 推理 (POST)")
 async def tts_post_endpoint(request: Request, body: TTS_Request):
-    req = body.dict()
+    req = body.model_dump()
     return await tts_handle(req, _get_pipeline(request))
 
 

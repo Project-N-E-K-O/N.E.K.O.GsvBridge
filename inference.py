@@ -16,7 +16,7 @@ from enum import Enum
 from io import BytesIO
 from typing import Optional
 
-from api_neko.audio_utils import pack_audio
+from api_neko.audio_utils import pack_audio, WavStreamEncoder
 
 
 class TaskStatus(str, Enum):
@@ -25,6 +25,7 @@ class TaskStatus(str, Enum):
     INFERRING = "inferring"
     DONE = "done"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -96,6 +97,10 @@ class InferTask:
     tts_params: dict
     # 输出配置
     media_type: str = "wav"
+    pcm48_wav: bool = False
+    retain_result: bool = True
+    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
+    release_when_done: bool = False
     # 输出缓冲区（自动创建）
     output: OutputBuffer = field(init=False)
     status: TaskStatus = TaskStatus.QUEUED
@@ -116,7 +121,7 @@ class InferenceEngine:
         await engine.stop()
     """
 
-    def __init__(self, tts_pipeline, validator, cut_method_names: list):
+    def __init__(self, tts_pipeline, validator, cut_method_names: list, *, max_completed_tasks: int = 100):
         self._pipeline = tts_pipeline
         self._validator = validator  # 实现了 validate_params(req) 的对象
         self._cut_method_names = cut_method_names
@@ -132,6 +137,8 @@ class InferenceEngine:
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._active_task: Optional[InferTask] = None
+        self._max_completed_tasks = max_completed_tasks
 
     def _next_id(self) -> int:
         with self._counter_lock:
@@ -147,12 +154,18 @@ class InferenceEngine:
     async def stop(self):
         """停止 Worker"""
         self._running = False
+        for task_id in list(self._tasks):
+            self.cancel_task(task_id)
         if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+            # Cancelling to_thread's waiter would leave GPU work running. Let
+            # the cooperative stop finish before retiring the shared pipeline.
+            await asyncio.shield(self._worker_task)
+        while not self._queue.empty():
+            task = self._queue.get_nowait()
+            task.status = TaskStatus.CANCELLED
+            task.output.mark_error("Task cancelled")
+            self._tasks.pop(task.task_id, None)
+            self._queue.task_done()
 
     def validate_params(self, req: dict) -> Optional[str]:
         """校验 TTS 请求参数，委托给 pipeline 后端的 validate_params"""
@@ -165,6 +178,9 @@ class InferenceEngine:
         sovits_weights: str,
         tts_params: dict,
         media_type: str = "wav",
+        *,
+        pcm48_wav: bool = False,
+        retain_result: bool = True,
     ) -> InferTask:
         """提交推理任务，返回 InferTask（含 task_id 和 output buffer）"""
         task_id = self._next_id()
@@ -176,8 +192,11 @@ class InferenceEngine:
             sovits_weights=sovits_weights,
             tts_params=tts_params,
             media_type=media_type,
+            pcm48_wav=pcm48_wav,
+            retain_result=retain_result,
         )
         self._tasks[task_id] = task
+        self._prune_completed_tasks()
         await self._queue.put(task)
         return task
 
@@ -196,7 +215,31 @@ class InferenceEngine:
 
     def cleanup_task(self, task_id: int):
         """清理已完成的任务（释放内存）"""
-        self._tasks.pop(task_id, None)
+        task = self._tasks.get(task_id)
+        if task is not None:
+            if task.output.done:
+                self._tasks.pop(task_id)
+            else:
+                task.release_when_done = True
+
+    def cancel_task(self, task_id: int):
+        """Cancel only this task; idle/probe connections cannot stop other clients."""
+        task = self._tasks.get(task_id)
+        if task is None or task.output.done:
+            return
+        task.cancelled.set()
+        if self._active_task is task and task.status == TaskStatus.INFERRING:
+            self._pipeline.stop()
+
+    def _prune_completed_tasks(self):
+        completed = [task_id for task_id, task in self._tasks.items()
+                     if task.retain_result and task.output.done]
+        for task_id in completed[:max(0, len(completed) - self._max_completed_tasks)]:
+            self._tasks.pop(task_id)
+
+    def _publish_chunk(self, task: InferTask, chunk: AudioChunk):
+        if not task.cancelled.is_set():
+            task.output.add_chunk(chunk)
 
     # ─── Worker ───
 
@@ -211,11 +254,22 @@ class InferenceEngine:
                 break
 
             try:
-                await self._process_task(task)
+                self._active_task = task
+                if not task.cancelled.is_set():
+                    await self._process_task(task)
+                task.status = TaskStatus.CANCELLED if task.cancelled.is_set() else TaskStatus.DONE
             except Exception as e:
-                task.output.mark_error(f"Worker error: {e}")
+                task.output.error = f"Worker error: {e}"
                 task.status = TaskStatus.ERROR
             finally:
+                if task.cancelled.is_set():
+                    task.status = TaskStatus.CANCELLED
+                    task.output.error = "Task cancelled"
+                task.output.mark_done()
+                self._active_task = None
+                if task.release_when_done:
+                    self._tasks.pop(task.task_id, None)
+                self._prune_completed_tasks()
                 self._queue.task_done()
 
     async def _process_task(self, task: InferTask):
@@ -226,20 +280,27 @@ class InferenceEngine:
 
         if need_gpt or need_sovits:
             task.status = TaskStatus.LOADING_MODEL
-            if need_gpt:
-                await asyncio.to_thread(self._pipeline.init_t2s_weights, task.gpt_weights)
-                self._current_gpt = task.gpt_weights
             if need_sovits:
+                self._current_sovits = ""
                 await asyncio.to_thread(self._pipeline.init_vits_weights, task.sovits_weights)
                 self._current_sovits = task.sovits_weights
+            if task.cancelled.is_set():
+                return
+            if need_gpt:
+                self._current_gpt = ""
+                await asyncio.to_thread(self._pipeline.init_t2s_weights, task.gpt_weights)
+                self._current_gpt = task.gpt_weights
+
+        if task.cancelled.is_set():
+            return
+        error = self.validate_params({**task.tts_params, "media_type": task.media_type})
+        if error:
+            raise ValueError(error)
 
         # 2. 推理
         task.status = TaskStatus.INFERRING
 
-        # 构建推理参数：尊重配置中的 return_fragment / streaming_mode
-        # 不强制覆盖，让 TTS.run() 走最优路径（批量推理+并行合成）
         req = dict(task.tts_params)
-        req["streaming_mode"] = False
 
         media_type = task.media_type
         chunk_index = 0
@@ -247,33 +308,38 @@ class InferenceEngine:
         def _run_inference():
             """在线程中执行推理（阻塞操作）"""
             nonlocal chunk_index
+            if task.cancelled.is_set():
+                return
+            encoder = WavStreamEncoder() if task.pcm48_wav else None
+            tts_generator = self._pipeline.run(req)
+
+            def publish(data, rate):
+                nonlocal chunk_index
+                chunk = AudioChunk(index=chunk_index, data=data, sample_rate=rate)
+                chunk_index += 1
+                self._loop.call_soon_threadsafe(self._publish_chunk, task, chunk)
+
             try:
-                tts_generator = self._pipeline.run(req)
                 for sr, audio_data in tts_generator:
-                    # 每个 chunk 打包为完整 WAV（含 header），
-                    # 这样前端 decodeAudioData 可以独立解码每个 chunk
-                    buf = BytesIO()
-                    data = pack_audio(buf, audio_data, sr, media_type).getvalue()
-
-                    chunk = AudioChunk(index=chunk_index, data=data, sample_rate=sr)
-                    chunk_index += 1
-                    # 线程安全地通知事件循环
-                    if self._loop and self._loop.is_running():
-                        self._loop.call_soon_threadsafe(task.output.add_chunk, chunk)
+                    if task.cancelled.is_set():
+                        break
+                    if encoder is not None:
+                        for data in encoder.feed(audio_data, sr):
+                            publish(data, encoder.sample_rate)
                     else:
-                        task.output.add_chunk(chunk)
+                        publish(pack_audio(BytesIO(), audio_data, sr, media_type).getvalue(), sr)
+                if encoder is not None and not task.cancelled.is_set():
+                    for data in encoder.flush():
+                        publish(data, encoder.sample_rate)
+                if chunk_index == 0 and not task.cancelled.is_set():
+                    raise ValueError("No audio returned by the synthesis backend")
+            finally:
+                tts_generator.close()
 
-                # 推理完成
-                if self._loop and self._loop.is_running():
-                    self._loop.call_soon_threadsafe(task.output.mark_done)
-                else:
-                    task.output.mark_done()
-            except Exception as e:
-                msg = str(e)
-                if self._loop and self._loop.is_running():
-                    self._loop.call_soon_threadsafe(task.output.mark_error, msg)
-                else:
-                    task.output.mark_error(msg)
-
-        await asyncio.to_thread(_run_inference)
-        task.status = TaskStatus.DONE if not task.output.error else TaskStatus.ERROR
+        try:
+            await asyncio.to_thread(_run_inference)
+        except Exception:
+            # The host may reset/reload its models while handling an inference
+            # exception. Do not reuse identities that no longer describe it.
+            self._current_gpt = self._current_sovits = ""
+            raise

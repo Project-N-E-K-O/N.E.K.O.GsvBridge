@@ -155,6 +155,66 @@ media_type = "wav"
 
 相对路径均以 `project_root` 为基准解析为绝对路径。
 
+## V5 兼容与配置边界
+
+Bridge 继续使用原有 `/api/v3/voices` 和 `/api/v3/tts/stream-input`，NEKO 本体无需修改。
+宿主需包含 V5 的 `TTS_infer_pack`、模型版本识别与配套声码器；Bridge 不安装或修改宿主。
+
+- 支持 `v5dev`、`v5turbo`，模型扫描复用宿主的权重识别函数（未安装宿主的独立 checkout
+  仍可按官方文件名发现模型）。两种官方底模配对共享 `s1v3.ckpt`，同名训练 GPT 优先。
+- `sample_steps`、`cfg_rate` 未指定时传递宿主自动值：官方 V5 Turbo 默认 4 步 / CFG 0，
+  V5 Dev 默认 32 步 / CFG 1.30。旧文件显式保存的数值继续生效。
+- 支持 `use_cuda_graph`、`use_flash_attention`，默认启用，实际可用能力由宿主决定。
+  上述 V5 参数适用于声音配置、v3 REST、两个 v3 WebSocket 入口和 v2 的 GET/POST。
+- 参数优先级为请求显式覆盖 → 声音配置（含 `voices/default.toml` 公共默认值）→ 宿主默认。
+  请求 JSON 可用 `null` 临时恢复 `sample_steps` / `cfg_rate` 的宿主默认；保存声音时省略自动值，
+  因为 TOML 没有 null。重新读取时仍先合并公共默认配置。旧编辑器未提交的新字段保留原值。
+- 通用示例位于 [`examples/voices/v5turbo.toml`](examples/voices/v5turbo.toml) 和
+  [`examples/voices/v5dev.toml`](examples/voices/v5dev.toml)，不会自动注册为可用音色。
+  需要用户在本机补充参考音频及准确文本，再通过配置 API 创建或复制到 `voices/`。
+
+`settings.toml` 可选 `default_voice_id` 用于解析 `_default`。它与 `last_voice_id`（启动时预加载）
+独立；未设置时保留原 `voices/default.toml` 行为。具体默认 ID、机器路径、用户音色 TOML、
+权重和参考音频均属于本机数据，不应加入 Git。公共示例和通用代码、测试才属于仓库交付。
+
+### NEKO 音频与任务生命周期
+
+- `stream-input` 固定输出独立的 **48 kHz / 单声道 / PCM16 WAV** 帧，每帧最多一秒音频。
+  旧采样率在 Bridge 内通过宿主已有的 `soxr` 重采样，正常结束前 flush 尾部；不新增运行时安装步骤。
+  通用 REST 和 `/tts/stream` 保留源采样率与媒体类型选择。
+- 保留 `init/append/text/flush/end`、`ready/sentence/sentence_done/flushed/done` 消息。
+  `sentence` 在首块音频可用时才发送；合成前失败返回 `error` 并关闭，不再提前表示合成已接受。
+  `end` 等待音频发完，再发送 `done` 并关闭。`flushed` 表示尾文本已提交，不表示音频全部发完。
+- 断连只取消该连接提交的任务。空的初始化验证连接不会停止其他客户端；排队的取消任务不再执行。
+  运行中的任务请求后端协作停止，丢弃迟到输出，并等待推理线程真正结束后才开始下一任务或换模型。
+  GSV 的停止检查位于宿主推理边界，不能立即抢占正在执行的 GPU kernel。
+- 流式任务完成/断连后释放任务和音频；REST 默认保留最近 100 个完成任务，较旧 ID 返回 404。
+  模型切换使参考音频缓存失效，使用相同参考音频路径也会重新提取特征。
+
+本次兼容保持按文本段推理。`streaming_mode` / `return_fragment` 会传递给宿主，实际输出能力
+取决于宿主；仅新增参数不能恢复宿主缺失的 `gpt_streaming` 语义 token 流式。
+NEKO 的连接测试约 10 秒超时、收到部分音频后仍可能判成功，以及 `init` 与 `_default` 的
+默认 ID 差异仍是客户端既有行为。Bridge 不通过改写 `init` 音色或伪造成功来绕过这些条件。
+
+### 测试
+
+在开发环境安装 `pytest`、`httpx` 和宿主提供的轻量运行依赖后，从仓库根目录运行：
+
+```bash
+python -m pytest tests -q
+```
+
+默认测试使用临时目录、模拟后端和进程内 WebSocket，不需要本机音色、模型、GPU 或监听端口。
+可选真实宿主测试通过 `GSV_TEST_HOST_ROOT` 指定宿主位置，使用仓库已有公共参考音频和临时
+推理配置，验证 V2ProPlus → Turbo → Dev → V2ProPlus 的协议与模型切换；不改写用户配置。
+
+```powershell
+$env:GSV_TEST_HOST_ROOT = 'C:\path\to\GPT-SoVITS'
+# 在宿主下的 api_neko 仓库根目录，使用宿主解释器和标准库测试运行器。
+# 测试程序通过变量定位宿主，不把该路径保存进仓库，也无需给宿主安装 pytest。
+& "$env:GSV_TEST_HOST_ROOT\runtime\python.exe" -m unittest discover -s tests -p test_gsv_host_integration.py -q
+```
+
 ## API 概览
 
 ### 健康检查

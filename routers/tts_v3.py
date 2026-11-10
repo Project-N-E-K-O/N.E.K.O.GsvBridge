@@ -12,13 +12,15 @@ GPT-SoVITS API v3 - TTS 推理路由 (v3)
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Optional, get_type_hints
+from pathlib import Path
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import create_model
 
-from api_neko.config import load_voice, load_default_config, VoiceConfig
+from api_neko.config import load_tts_voice, VoiceConfig, InferParams
+from api_neko.audio_utils import join_wav_chunks
 
 
 router = APIRouter(prefix="/api/v3", tags=["tts-v3"])
@@ -26,19 +28,16 @@ router = APIRouter(prefix="/api/v3", tags=["tts-v3"])
 
 # ─── 请求模型 ───
 
-class TTSSubmitRequest(BaseModel):
+TTSParameterOverrides = create_model(
+    "TTSParameterOverrides",
+    **{name: (Optional[annotation], None) for name, annotation in get_type_hints(InferParams).items()},
+)
+
+
+class TTSSubmitRequest(TTSParameterOverrides):
     """v3 TTS 提交请求"""
     text: str
     voice_id: str = "_default"
-    # 可选覆盖参数
-    text_lang: Optional[str] = None
-    speed_factor: Optional[float] = None
-    temperature: Optional[float] = None
-    top_k: Optional[int] = None
-    top_p: Optional[float] = None
-    seed: Optional[int] = None
-    batch_size: Optional[int] = None
-    text_split_method: Optional[str] = None
     media_type: Optional[str] = None
 
 
@@ -49,14 +48,13 @@ def _get_engine(request: Request):
 
 def _build_tts_params(voice_cfg: VoiceConfig, text: str, overrides: dict) -> dict:
     """从声音配置 + 覆盖参数构建 TTS 推理参数"""
-    return voice_cfg.to_tts_inputs(text, **{k: v for k, v in overrides.items() if v is not None})
+    params = TTSParameterOverrides.model_validate(overrides).model_dump(exclude_unset=True)
+    return voice_cfg.to_tts_inputs(text, **params)
 
 
 def _load_voice_config(voice_id: str) -> VoiceConfig:
     """加载声音配置"""
-    if voice_id == "_default":
-        return load_default_config()
-    return load_voice(voice_id)
+    return load_tts_voice(voice_id)
 
 
 def _check_voice_backend(voice_cfg: VoiceConfig, request_or_app) -> str | None:
@@ -86,6 +84,31 @@ def _resolve_model_weights(voice_cfg: VoiceConfig) -> tuple[str, str]:
     return gpt_w, sovits_w
 
 
+async def _wait_stream_end(websocket: WebSocket, sender_task: asyncio.Task) -> bool:
+    """Watch disconnects while draining audio, including after the client's end."""
+    async def disconnected():
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait((sender_task, watcher), return_when=asyncio.FIRST_COMPLETED)
+        if watcher in done:
+            return False
+        await sender_task
+        return True
+    finally:
+        for task in (watcher, sender_task):
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
 # ─── REST 端点 ───
 
 @router.post("/tts", summary="提交 TTS 推理任务")
@@ -100,21 +123,13 @@ async def tts_submit(request: Request, body: TTSSubmitRequest):
         return JSONResponse(status_code=404, content={"message": f"voice_id '{body.voice_id}' not found"})
 
     # 构建推理参数
-    overrides = {
-        "text_lang": body.text_lang,
-        "speed_factor": body.speed_factor,
-        "temperature": body.temperature,
-        "top_k": body.top_k,
-        "top_p": body.top_p,
-        "seed": body.seed,
-        "batch_size": body.batch_size,
-        "text_split_method": body.text_split_method,
-    }
+    overrides = body.model_dump(exclude_unset=True)
     tts_params = _build_tts_params(voice_cfg, body.text, overrides)
     media_type = body.media_type or voice_cfg.output.media_type
 
     # 校验参数
-    err = engine.validate_params({**tts_params, "media_type": media_type})
+    err = engine.validate_params({**tts_params, "media_type": media_type,
+                                  "model_version": voice_cfg.model.version})
     if err:
         return JSONResponse(status_code=400, content={"message": err})
 
@@ -186,7 +201,8 @@ async def tts_task_audio(request: Request, task_id: int):
         return JSONResponse(status_code=408, content={"message": "task timeout"})
 
     # 拼接所有 chunk
-    audio_data = b"".join(chunk.data for chunk in task.output.chunks)
+    chunks = [chunk.data for chunk in task.output.chunks]
+    audio_data = join_wav_chunks(chunks) if task.media_type == "wav" else b"".join(chunks)
     return Response(audio_data, media_type=f"audio/{task.media_type}")
 
 
@@ -215,7 +231,8 @@ async def tts_ws_stream(websocket: WebSocket):
     5. JSON: {"type": "error", "message": "..."}
     """
     await websocket.accept()
-
+    task = None
+    engine = websocket.app.state.inference_engine
     try:
         # 接收请求
         data = await websocket.receive_json()
@@ -233,15 +250,13 @@ async def tts_ws_stream(websocket: WebSocket):
             return
 
         # 构建参数
-        overrides = {k: data.get(k) for k in [
-            "text_lang", "speed_factor", "temperature", "top_k", "top_p",
-            "seed", "batch_size", "text_split_method",
-        ]}
+        overrides = data
         tts_params = _build_tts_params(voice_cfg, text, overrides)
         media_type = data.get("media_type") or voice_cfg.output.media_type
 
         # 校验
-        err = engine.validate_params({**tts_params, "media_type": media_type})
+        err = engine.validate_params({**tts_params, "media_type": media_type,
+                                      "model_version": voice_cfg.model.version})
         if err:
             await websocket.send_json({"type": "error", "message": err})
             await websocket.close()
@@ -262,6 +277,7 @@ async def tts_ws_stream(websocket: WebSocket):
             sovits_weights=sovits_w,
             tts_params=tts_params,
             media_type=media_type,
+            retain_result=False,
         )
 
         await websocket.send_json({
@@ -270,31 +286,24 @@ async def tts_ws_stream(websocket: WebSocket):
             "timestamp": task.timestamp,
         })
 
-        # 流式推送 chunk
-        sent_index = 0
-        last_status = None
+        async def send_audio():
+            sent_index = 0
+            last_status = None
+            while not task.output.done or sent_index < len(task.output.chunks):
+                if task.status.value != last_status:
+                    last_status = task.status.value
+                    await websocket.send_json({"type": "status", "status": last_status})
+                while sent_index < len(task.output.chunks):
+                    await websocket.send_bytes(task.output.chunks[sent_index].data)
+                    sent_index += 1
+                if not task.output.done:
+                    await task.output.wait_for_update(timeout=5.0)
+            if task.output.error:
+                await websocket.send_json({"type": "error", "message": task.output.error})
+            else:
+                await websocket.send_json({"type": "done", "chunks_total": sent_index})
 
-        while not task.output.done or sent_index < len(task.output.chunks):
-            # 推送状态变化
-            if task.status.value != last_status:
-                last_status = task.status.value
-                await websocket.send_json({"type": "status", "status": last_status})
-
-            # 推送新 chunk
-            while sent_index < len(task.output.chunks):
-                chunk = task.output.chunks[sent_index]
-                await websocket.send_bytes(chunk.data)
-                sent_index += 1
-
-            # 如果还没完成，等待新数据
-            if not task.output.done:
-                await task.output.wait_for_update(timeout=5.0)
-
-        # 发送完成或错误
-        if task.output.error:
-            await websocket.send_json({"type": "error", "message": task.output.error})
-        else:
-            await websocket.send_json({"type": "done", "chunks_total": len(task.output.chunks)})
+        await _wait_stream_end(websocket, asyncio.create_task(send_audio()))
 
     except WebSocketDisconnect:
         pass
@@ -304,6 +313,9 @@ async def tts_ws_stream(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        if task is not None:
+            engine.cancel_task(task.task_id)
+            engine.cleanup_task(task.task_id)
         try:
             await websocket.close()
         except Exception:
@@ -373,213 +385,151 @@ class _TextBuffer:
 
 @router.websocket("/tts/stream-input")
 async def tts_ws_stream_input(websocket: WebSocket):
-    """
-    双向流式 WebSocket：客户端高频发送文本片段，服务端自动切句并流式返回音频。
-    接收和发送完全非阻塞，通过 task_queue 解耦。
+    """Accept incremental text and return independent mono 48 kHz PCM WAV frames.
 
-    协议：
-    ── 客户端 → 服务端（JSON）──
-    1. {cmd:"init", voice_id:"...", text_lang:"...", ...overrides}  初始化配置
-    2. {cmd:"text", data:"完整文本段落"}                             直接提交推理
-    3. {cmd:"append", data:"碎片..."}                               追加到缓冲区（自动切句）
-    4. {cmd:"flush"}                                                立即合成缓冲区剩余文本
-    5. {cmd:"end"}                                                  结束，清空并关闭
-
-    ── 服务端 → 客户端 ──
-    1. {type:"ready"}                                               初始化成功
-    2. {type:"sentence", text:"...", task_id:N}                     开始合成某句
-    3. Binary: WAV chunk                                            音频数据
-    4. {type:"sentence_done", task_id:N}                            某句合成完成
-    5. {type:"flushed"}                                             flush 完成
-    6. {type:"done"}                                                全部完成（end 后）
-    7. {type:"error", message:"..."}                                错误
+    The existing init/append/flush/end and ready/sentence/sentence_done/done
+    messages are preserved. A sentence is announced only when its first audio
+    is ready; an error before audio must not look like successful synthesis.
     """
     await websocket.accept()
-
     engine = websocket.app.state.inference_engine
-    voice_cfg: Optional[VoiceConfig] = None
-    session_voice_id: str = "_default"
-    overrides: dict = {}
+    voice_cfg = None
+    session_voice_id = "_default"
+    overrides = {}
     text_buffer = _TextBuffer()
-
-    # task_queue: 接收协程 → 发送协程 的通信通道
-    # 放入 InferTask 表示有新任务，放入 None 表示会话结束
-    task_queue: asyncio.Queue = asyncio.Queue()
-    # send_lock: 防止并发写 WS（WebSocket 不支持并发 send）
+    task_queue = asyncio.Queue()
+    owned_tasks = set()
     send_lock = asyncio.Lock()
+    failed = False
 
-    async def _safe_send_json(data: dict):
+    async def send_json(data):
         async with send_lock:
             await websocket.send_json(data)
 
-    async def _safe_send_bytes(data: bytes):
+    async def fail(message):
+        nonlocal failed
+        failed = True
         async with send_lock:
-            await websocket.send_bytes(data)
+            await websocket.send_json({"type": "error", "message": str(message)})
+            await websocket.close()
 
-    async def _submit_text(text: str):
-        """将一段文本提交为推理任务"""
+    async def submit_text(text):
         if not text.strip() or voice_cfg is None:
             return
-        tts_params = _build_tts_params(voice_cfg, text, overrides)
-        media_type = overrides.get("media_type") or voice_cfg.output.media_type
-
-        gpt_w, sovits_w = _resolve_model_weights(voice_cfg)
+        params = _build_tts_params(voice_cfg, text, overrides)
+        gpt, sovits = _resolve_model_weights(voice_cfg)
         task = await engine.submit(
-            voice_id=session_voice_id,
-            gpt_weights=gpt_w,
-            sovits_weights=sovits_w,
-            tts_params=tts_params,
-            media_type=media_type,
+            voice_id=session_voice_id, gpt_weights=gpt, sovits_weights=sovits,
+            tts_params=params, media_type="wav", pcm48_wav=True, retain_result=False,
         )
-
-        await _safe_send_json({
-            "type": "sentence",
-            "text": text,
-            "task_id": task.task_id,
-        })
-
-        # 放入发送队列
+        owned_tasks.add(task.task_id)
         await task_queue.put(task)
 
-    # ─── 发送协程：从 task_queue 取任务，按顺序推送音频 ───
-
-    async def _sender():
-        """后台协程：按顺序推送每个 task 的音频 chunk"""
+    async def sender():
+        current = None
         try:
             while True:
-                task = await task_queue.get()
-                if task is None:
-                    break
-
-                sent_index = 0
-                while not task.output.done or sent_index < len(task.output.chunks):
-                    while sent_index < len(task.output.chunks):
-                        chunk = task.output.chunks[sent_index]
-                        await _safe_send_bytes(chunk.data)
-                        sent_index += 1
-
-                    if not task.output.done:
-                        await task.output.wait_for_update(timeout=5.0)
-
-                if task.output.error:
-                    await _safe_send_json({"type": "error", "message": task.output.error})
-                else:
-                    await _safe_send_json({
-                        "type": "sentence_done",
-                        "task_id": task.task_id,
-                        "chunks_sent": sent_index,
-                    })
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            try:
-                await _safe_send_json({"type": "error", "message": f"sender error: {e}"})
-            except Exception:
-                pass
-
-    # 启动发送协程
-    sender_task = asyncio.create_task(_sender())
-
-    # ─── 接收循环：处理客户端指令 ───
-
-    try:
-        while True:
-            try:
-                data = await asyncio.wait_for(websocket.receive_json(), timeout=300.0)
-            except asyncio.TimeoutError:
-                await _safe_send_json({"type": "error", "message": "session timeout"})
-                break
-
-            cmd = data.get("cmd", "")
-
-            if cmd == "init":
-                voice_id = data.get("voice_id", "_default")
+                current = await task_queue.get()
+                if current is None:
+                    return
+                sent = 0
+                while not current.output.done or sent < len(current.output.chunks):
+                    if current.output.error:
+                        await fail(current.output.error)
+                        return
+                    while sent < len(current.output.chunks):
+                        if sent == 0:
+                            await send_json({"type": "sentence", "text": current.tts_params["text"],
+                                             "task_id": current.task_id})
+                        async with send_lock:
+                            await websocket.send_bytes(current.output.chunks[sent].data)
+                        sent += 1
+                    if not current.output.done:
+                        await current.output.wait_for_update(timeout=5.0)
+                if current.output.error:
+                    await fail(current.output.error)
+                    return
+                await send_json({"type": "sentence_done", "task_id": current.task_id,
+                                 "chunks_sent": sent})
+                engine.cleanup_task(current.task_id)
+                owned_tasks.discard(current.task_id)
+                current = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not failed:
                 try:
-                    voice_cfg = _load_voice_config(voice_id)
-                except FileNotFoundError:
-                    await _safe_send_json({"type": "error", "message": f"voice_id '{voice_id}' not found"})
-                    break
+                    await fail(exc)
+                except Exception:
+                    pass
 
-                # 校验 voice 后端兼容性
-                backend_err = _check_voice_backend(voice_cfg, websocket)
-                if backend_err:
-                    await _safe_send_json({"type": "error", "message": backend_err})
-                    break
-
-                session_voice_id = voice_id
-                overrides = {k: data.get(k) for k in [
-                    "text_lang", "speed_factor", "temperature", "top_k", "top_p",
-                    "seed", "batch_size", "text_split_method", "media_type",
-                ] if data.get(k) is not None}
-
-                await _safe_send_json({"type": "ready", "voice_id": voice_id})
-
-            elif cmd == "text":
-                # 直接提交整段文本进行推理（TTS 引擎内部会按 text_split_method 切分）
-                if voice_cfg is None:
-                    await _safe_send_json({"type": "error", "message": "not initialized, send init first"})
-                    continue
-
-                text_data = data.get("data", "").strip()
-                if text_data:
-                    await _submit_text(text_data)
-
-            elif cmd == "append":
-                # 碎片累积模式：追加到缓冲区，自动检测句子边界
-                if voice_cfg is None:
-                    await _safe_send_json({"type": "error", "message": "not initialized, send init first"})
-                    continue
-
-                text_buffer.append(data.get("data", ""))
-                for sentence in text_buffer.extract_sentences():
-                    await _submit_text(sentence)
-
-            elif cmd == "flush":
-                if voice_cfg is None:
-                    continue
-                remaining = text_buffer.flush()
-                if remaining:
-                    await _submit_text(remaining)
-                # flushed 信号在所有 flush 产生的任务完成后由 sender 隐式完成
-                # 这里放一个标记任务（None 不行，因为 None 是结束信号）
-                # 改为：直接发 flushed，客户端通过 sentence_done 知道每句完成
-                await _safe_send_json({"type": "flushed"})
-
-            elif cmd == "end":
-                print(f"[stream-input] end cmd received, queue size: {task_queue.qsize()}")
+    sender_task = asyncio.create_task(sender())
+    try:
+        while not failed:
+            data = await asyncio.wait_for(websocket.receive_json(), timeout=300.0)
+            cmd = data.get("cmd", "")
+            if cmd == "init":
                 if voice_cfg is not None:
-                    remaining = text_buffer.flush()
-                    if remaining:
-                        await _submit_text(remaining)
-
-                # 发送结束信号给 sender
+                    raise ValueError("This connection is already initialized")
+                session_voice_id = data.get("voice_id", "_default")
+                voice_cfg = _load_voice_config(session_voice_id)
+                error = _check_voice_backend(voice_cfg, websocket)
+                if error:
+                    raise ValueError(error)
+                # Keep ready within the client's handshake timeout. This checks
+                # configuration only; loading/inference stays on the shared worker.
+                if not voice_cfg.ref_audio.path:
+                    raise ValueError("ref_audio_path is required")
+                paths = [voice_cfg.ref_audio.path, voice_cfg.model.gpt_weights,
+                         voice_cfg.model.onnx_model_dir or voice_cfg.model.sovits_weights]
+                for path in paths:
+                    if path and not Path(voice_cfg._resolve_path(path)).exists():
+                        raise ValueError(f"Configured file does not exist: {path}")
+                if voice_cfg.model.version in ("v3", "v4", "v5dev", "v5turbo") and not voice_cfg.ref_audio.prompt_text.strip():
+                    raise ValueError("prompt_text is required for V3/V4/V5")
+                overrides = TTSParameterOverrides.model_validate(data).model_dump(exclude_unset=True)
+                await send_json({"type": "ready", "voice_id": session_voice_id})
+            elif cmd in ("text", "append", "flush"):
+                if voice_cfg is None:
+                    raise ValueError("not initialized, send init first")
+                if cmd == "text":
+                    await submit_text(data.get("data", ""))
+                elif cmd == "append":
+                    text_buffer.append(data.get("data", ""))
+                    for sentence in text_buffer.extract_sentences():
+                        await submit_text(sentence)
+                else:
+                    await submit_text(text_buffer.flush())
+                    await send_json({"type": "flushed"})
+            elif cmd == "end":
+                if voice_cfg is not None:
+                    await submit_text(text_buffer.flush())
                 await task_queue.put(None)
-                print("[stream-input] waiting for sender to finish...")
-                # 等待 sender 完成所有推送
-                await sender_task
-                print("[stream-input] sender finished, sending done")
-                await _safe_send_json({"type": "done"})
+                connected = await _wait_stream_end(websocket, sender_task)
+                if connected and not failed:
+                    await send_json({"type": "done"})
                 break
-
             else:
-                await _safe_send_json({"type": "error", "message": f"unknown cmd: {cmd}"})
-
+                raise ValueError(f"unknown cmd: {cmd}")
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        try:
-            await _safe_send_json({"type": "error", "message": str(e)})
-        except Exception:
-            pass
-    finally:
-        # 确保 sender 协程退出
-        if not sender_task.done():
-            await task_queue.put(None)
-            sender_task.cancel()
+    except Exception as exc:
+        if not failed:
             try:
-                await sender_task
-            except (asyncio.CancelledError, Exception):
+                await fail(exc)
+            except Exception:
                 pass
+    finally:
+        # The initial validation socket has no owned jobs. It must not stop the
+        # shared pipeline used by another client's actual speech connection.
+        for task_id in owned_tasks:
+            engine.cancel_task(task_id)
+            engine.cleanup_task(task_id)
+        sender_task.cancel()
+        try:
+            await sender_task
+        except asyncio.CancelledError:
+            pass
         try:
             await websocket.close()
         except Exception:

@@ -1,0 +1,25 @@
+# Portable schema example. Copy to voices/ and supply your own reference audio.
+[voice]
+id = "example-v5turbo"
+name = "V5 Turbo example"
+description = "Replace the reference audio and transcript before use."
+
+[model]
+version = "v5turbo"
+backend = "gsv"
+gpt_weights = "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+sovits_weights = "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth"
+
+[ref_audio]
+path = "reference_audios/example.wav"
+prompt_text = "Replace this with the exact transcript of your reference audio."
+prompt_lang = "all_zh"
+
+[params]
+text_lang = "all_zh"
+use_cuda_graph = true
+use_flash_attention = true
+# sample_steps and cfg_rate are omitted to follow host/model defaults.
+
+[output]
+media_type = "wav"

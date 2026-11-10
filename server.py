@@ -129,9 +129,10 @@ async def lifespan(app_instance):
     await engine.start()
     app_instance.state.inference_engine = engine
 
-    yield
-
-    await engine.stop()
+    try:
+        yield
+    finally:
+        await engine.stop()
 
 
 app = FastAPI(
@@ -169,7 +170,7 @@ if _FRONTEND_DIST.is_dir():
     )
 else:
     print(f"[warning] 前端静态文件目录不存在: {_FRONTEND_DIST}")
-    print(f"[warning] 请先在 api_neko/frontend/ 下执行 npx nuxt generate 构建前端")
+    print("[warning] 请先在 api_neko/frontend/ 下执行 npx nuxt generate 构建前端")
 
 
 def main():

@@ -6,11 +6,75 @@ GPT-SoVITS API v3 - 音频打包工具函数
 """
 
 import subprocess
-import threading
 import wave
 from io import BytesIO
 
 import numpy as np
+import soxr
+
+
+class WavStreamEncoder:
+    """Encode mono PCM as bounded, independently decodable 48 kHz WAV frames."""
+
+    sample_rate = 48000
+    frame_samples = 48000
+
+    def __init__(self):
+        self._source_rate = None
+        self._resampler = None
+
+    def _pack(self, audio):
+        pcm = (audio * 32768.0).clip(-32768, 32767).astype(np.int16)
+        return [pack_wav(BytesIO(), pcm[start:start + self.frame_samples], self.sample_rate).getvalue()
+                for start in range(0, len(pcm), self.frame_samples)]
+
+    def feed(self, audio: np.ndarray, source_rate: int) -> list[bytes]:
+        if self._source_rate is None:
+            self._source_rate = source_rate
+            if source_rate != self.sample_rate:
+                self._resampler = soxr.ResampleStream(source_rate, self.sample_rate, 1, dtype="float32")
+        elif source_rate != self._source_rate:
+            raise ValueError("Sample rate changed inside one synthesis task")
+        audio = np.asarray(audio)
+        if audio.ndim != 1:
+            raise ValueError("TTS output must be mono")
+        if audio.dtype == np.int16:
+            # Preserve int16 exactly for native 48 kHz output.
+            if self._resampler is None:
+                return [pack_wav(BytesIO(), audio[start:start + self.frame_samples], self.sample_rate).getvalue()
+                        for start in range(0, len(audio), self.frame_samples)]
+            audio = audio.astype(np.float32) / 32768.0
+        else:
+            audio = audio.astype(np.float32)
+        if self._resampler is not None:
+            audio = self._resampler.resample_chunk(audio)
+        return self._pack(audio)
+
+    def flush(self) -> list[bytes]:
+        if self._resampler is None:
+            return []
+        tail = self._resampler.resample_chunk(np.empty(0, dtype=np.float32), last=True)
+        self._resampler = None
+        return self._pack(tail)
+
+
+def join_wav_chunks(chunks: list[bytes]) -> bytes:
+    """Return one WAV file rather than concatenating multiple RIFF headers."""
+    output = BytesIO()
+    with wave.open(output, "wb") as writer:
+        params = None
+        for chunk in chunks:
+            with wave.open(BytesIO(chunk), "rb") as reader:
+                current = (reader.getnchannels(), reader.getsampwidth(), reader.getframerate())
+                if params is None:
+                    params = current
+                    writer.setnchannels(params[0])
+                    writer.setsampwidth(params[1])
+                    writer.setframerate(params[2])
+                elif current != params:
+                    raise ValueError("Inconsistent WAV formats in one task")
+                writer.writeframes(reader.readframes(reader.getnframes()))
+    return output.getvalue()
 
 
 def pack_ogg(io_buffer: BytesIO, data: np.ndarray, rate: int) -> BytesIO:

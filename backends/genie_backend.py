@@ -197,6 +197,9 @@ class GeniePipeline(BasePipeline):
         """Genie 不分开加载 T2S 权重，忽略"""
         logger.debug(f"[Genie Backend] init_t2s_weights 被调用但 Genie 不需要单独加载 T2S: {path}")
 
+    def stop(self) -> None:
+        self._tts_client.stop_event.set()
+
     def init_vits_weights(self, path: str) -> None:
         """加载 ONNX 模型目录
 
