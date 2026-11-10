@@ -103,6 +103,7 @@ class StaticAssetTests(TestCase):
                 for path in ("/tts", "/config", "/models"):
                     response = client.get(path, follow_redirects=False)
                     self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
                     self.assertEqual(response.headers["cache-control"], "no-cache")
                     self.assertNotIn("location", response.headers)
                 asset = client.get("/asset.abc123.js")

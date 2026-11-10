@@ -77,12 +77,14 @@ class FrontendApp:
             return
 
         extension = Path(request_path).suffix
+        media_path = request_path
         if request_path in ("/tts", "/config", "/models") and (self.directory / normalized_path / "index.html").is_file():
             # Serve known prerendered pages directly, preserving StaticFiles'
             # conditional/range handling without its directory redirect.
             path = request_path + "/"
             scope = {**scope, "path": path, "raw_path": path.encode()}
             extension = ".html"
+            media_path = path + "index.html"
         fallback_sent = False
 
         async def send_response(message):
@@ -115,7 +117,7 @@ class FrontendApp:
                         if name.lower() != b"content-type"
                     ]
                     headers.append(
-                        (b"content-type", _content_type_header(request_path).encode())
+                        (b"content-type", _content_type_header(media_path).encode())
                     )
                     message = {**message, "headers": headers}
                 if status in (200, 206, 304) and (
