@@ -53,7 +53,6 @@ def _is_client_route(path: str) -> bool:
         and parts[0] == "config"
         and parts[1] not in ("", ".", "..")
         and "\x00" not in parts[1]
-        and not Path(parts[1]).suffix
     )
 
 

@@ -9,6 +9,32 @@ from api_neko.routers import config as router
 
 
 class ModelCatalogTests(TestCase):
+    def test_pretrained_gpt_scan_uses_host_compatibility_for_every_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pretrained = root / "GPT_SoVITS/pretrained_models"
+            pretrained.mkdir(parents=True)
+            for name in router._PRETRAINED_GPT_VERSIONS:
+                (pretrained / name).write_bytes(b"test GPT")
+            expected = {
+                "v1": "s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
+                "v2": "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
+                **dict.fromkeys(("v3", "v4", "v2Pro", "v2ProPlus", "v5dev", "v5turbo"), "s1v3.ckpt"),
+            }
+            with patch.object(router, "_PROJECT_ROOT", root):
+                for version, name in expected.items():
+                    with self.subTest(version=version):
+                        paths = router._scan_weights(router._GPT_WEIGHT_ROOTS, {".ckpt"}, version)
+                        self.assertEqual([Path(path).name for path in paths], [name])
+                # Shared GPT bases must also pair in the model catalog.
+                for version in ("v4", "v2Pro", "v2ProPlus"):
+                    (pretrained / f"s2G{version}.pth").write_bytes(b"test SoVITS")
+                with patch("api_neko.backends.gsv_backend.sovits_model_version", side_effect=ImportError):
+                    models = router._scan_gsv_models()
+                for entry in models:
+                    if entry["sovits"]:
+                        self.assertEqual(entry["gpt"]["filename"], "s1v3.ckpt")
+
     def test_host_weight_reader_handles_header_based_finetunes(self):
         reader = Mock(return_value=("v2", "v5turbo", True))
         with patch.dict("sys.modules", {"GPT_SoVITS.process_ckpt": SimpleNamespace(

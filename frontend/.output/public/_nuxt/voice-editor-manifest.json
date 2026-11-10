@@ -1,5 +1,5 @@
 {
-  "entry": "voice-editor.60789f2fe9ad.js",
+  "entry": "voice-editor.a8b1bfa2fc5a.js",
   "legacyRoute": "C-I8AjUq.js",
   "inputs": [
     "src/VoiceEditor.vue",
@@ -8,5 +8,5 @@
     "scripts/build.mjs",
     "package-lock.json"
   ],
-  "sourceSHA256": "f79768285e1b84bc431ba2c97533d33f63da6772565f458f666dd0bed5604b87"
+  "sourceSHA256": "7b575e3bfebdee6a627649b3312d56779f5573993940fee2417b6b4d9cadc056"
 }

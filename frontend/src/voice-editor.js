@@ -51,6 +51,7 @@ const labels = {
     autoHelp: '自动值随模型版本变化；已有的自定义值会保留。',
     versionHelp: '切换版本会重新选择匹配的权重，参考音频和声音信息保持不变。',
     loading: '正在加载配置…', missing: '配置不存在或加载失败', required: '请填写声音 ID',
+    requiredWeights: '请等待扫描完成并选择 GPT 和 SoVITS 权重',
   },
   en: {
     auto: 'Use model default', autoValue: 'Current default', custom: 'Custom', cfg: 'CFG guidance',
@@ -58,6 +59,7 @@ const labels = {
     autoHelp: 'Automatic values follow the model version. Existing custom values are preserved.',
     versionHelp: 'Changing the version selects matching weights and keeps the reference audio and voice information.',
     loading: 'Loading configuration…', missing: 'Configuration not found or could not be loaded', required: 'Enter a voice ID',
+    requiredWeights: 'Wait for scanning to finish and select both GPT and SoVITS weights',
   },
   ja: {
     auto: 'モデルの既定値', autoValue: '現在の既定値', custom: 'カスタム', cfg: 'CFG ガイダンス',
@@ -65,6 +67,7 @@ const labels = {
     autoHelp: '自動値はモデルに従います。既存のカスタム値は保持されます。',
     versionHelp: 'バージョン変更時に対応する重みを選択し、参照音声と音声情報を保持します。',
     loading: '設定を読み込み中…', missing: '設定が存在しないか読み込みに失敗しました', required: '音声 ID を入力してください',
+    requiredWeights: 'スキャン完了後、GPT と SoVITS の重みを選択してください',
   },
   ko: {
     auto: '모델 기본값 사용', autoValue: '현재 기본값', custom: '사용자 지정', cfg: 'CFG 가이던스',
@@ -72,6 +75,7 @@ const labels = {
     autoHelp: '자동 값은 모델 버전을 따릅니다. 기존 사용자 지정 값은 유지됩니다.',
     versionHelp: '버전을 변경하면 일치하는 가중치를 선택하고 참조 오디오와 음성 정보를 유지합니다.',
     loading: '설정 불러오는 중…', missing: '설정이 없거나 불러오지 못했습니다', required: '음성 ID를 입력하세요',
+    requiredWeights: '스캔이 완료된 후 GPT와 SoVITS 가중치를 모두 선택하세요',
   },
 };
 

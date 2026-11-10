@@ -122,8 +122,8 @@ async def tts_handle(req: dict, engine):
                 streaming_generator(),
                 media_type=f"audio/{media_type}",
             )
-        if not await task.output.wait_until_done():
-            return JSONResponse(status_code=408, content={"message": "task timeout"})
+        # Legacy v2 waits through queueing and synthesis without a server deadline.
+        await task.output.wait_until_done(timeout=None)
         if task.output.error:
             return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": task.output.error})
         chunks = [chunk.data for chunk in task.output.chunks]

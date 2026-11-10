@@ -90,7 +90,7 @@ class VoiceEditorBrowserTests(TestCase):
                             expect(page.get_by_test_id("sample_steps-auto")).to_be_checked()
                             expect(page.get_by_test_id("sample_steps-default")).to_contain_text("4")
                             expect(page.get_by_test_id("cfg_rate-default")).to_contain_text("0")
-                            page.get_by_test_id("voice-id").fill("browser-turbo")
+                            page.get_by_test_id("voice-id").fill("browser.turbo")
                             page.get_by_test_id("voice-name").fill("V5 Turbo test")
                             page.get_by_test_id("reference-path").fill(str(reference))
                             page.get_by_test_id("reference-transcript").fill("Public test transcript")
@@ -98,21 +98,36 @@ class VoiceEditorBrowserTests(TestCase):
                             page.get_by_test_id("save-voice").click()
                             expect(page).to_have_url(base + "/config")
 
-                            page.goto(base + "/config/browser-turbo")
+                            page.goto(base + "/config/browser.turbo")
                             expect(page.get_by_test_id("model-version")).to_have_value("v5turbo", timeout=30000)
                             expect(page.get_by_test_id("sample_steps-auto")).to_be_checked()
                             expect(page.get_by_test_id("cfg_rate-auto")).to_be_checked()
                             expect(page.get_by_test_id("use_flash_attention")).not_to_be_checked()
-                            saved = config.load_voice("browser-turbo")
+                            saved = config.load_voice("browser.turbo")
                             self.assertIsNone(saved.params.sample_steps)
                             self.assertIsNone(saved.params.cfg_rate)
                             self.assertIs(saved.params.use_flash_attention, False)
 
                             page.goto(base + "/config/new")
                             expect(page.get_by_test_id("model-version")).to_be_visible()
-                            page.get_by_test_id("model-version").select_option("v5dev")
+                            held_scans = []
+                            scan_url = "**/api/v3/scan/sovits-weights?version=v5dev"
+                            page.route(scan_url, lambda route: held_scans.append(route))
+                            with page.expect_request(scan_url):
+                                page.get_by_test_id("model-version").select_option("v5dev")
+                            expect(page.get_by_test_id("save-voice")).to_be_disabled()
+                            self.assertEqual(len(held_scans), 1)
+                            held_scans[0].continue_()
+                            page.unroute(scan_url)
                             expect(page.get_by_test_id("sovits-weights")).to_have_value(
                                 re.compile(r"s2Gv5dev\.pth$"))
+                            expect(page.get_by_test_id("save-voice")).to_be_enabled()
+                            # An incomplete pair must remain unsavable after scanning.
+                            selected_gpt = page.get_by_test_id("gpt-weights").input_value()
+                            page.get_by_test_id("gpt-weights").evaluate("element => { element.value = ''; element.dispatchEvent(new Event('change', { bubbles: true })); }")
+                            expect(page.get_by_test_id("save-voice")).to_be_disabled()
+                            page.get_by_test_id("gpt-weights").select_option(selected_gpt)
+                            expect(page.get_by_test_id("save-voice")).to_be_enabled()
                             expect(page.get_by_test_id("sample_steps-default")).to_contain_text("32")
                             expect(page.get_by_test_id("cfg_rate-default")).to_contain_text("1.3")
                             page.get_by_test_id("sample_steps-auto").uncheck()

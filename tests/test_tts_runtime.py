@@ -17,7 +17,7 @@ import numpy as np
 
 from api_neko import config
 from api_neko.backends.gsv_backend import GSVPipeline
-from api_neko.inference import InferenceEngine, TaskStatus
+from api_neko.inference import InferenceEngine, OutputBuffer, TaskStatus
 from api_neko.routers import tts, tts_v3
 
 
@@ -196,6 +196,27 @@ class EngineTests(IsolatedAsyncioTestCase):
         self.assertFalse(await task.output.wait_until_done(timeout=0.02))
         self.assertTrue(await task.output.wait_until_done(timeout=2))
         self.assertEqual(len(task.output.chunks), 35)
+
+    async def test_v2_waits_past_the_default_output_deadline_while_queued(self):
+        original_wait = OutputBuffer.wait_until_done
+
+        async def shortened_default(output, timeout=0.02):
+            return await original_wait(output, timeout=timeout)
+
+        self.pipeline.release.clear()
+        first = await self.submit("long v3")
+        self.assertTrue(await asyncio.to_thread(self.pipeline.started.wait, 2))
+        with patch.object(OutputBuffer, "wait_until_done", shortened_default):
+            legacy = asyncio.create_task(tts.tts_handle({"text": "queued v2"}, self.engine))
+            try:
+                await asyncio.sleep(0.06)
+                self.assertFalse(legacy.done())
+            finally:
+                self.pipeline.release.set()
+                response = await legacy
+            self.assertEqual(response.status_code, 200)
+        await finished(first)
+        self.assertEqual([req["text"] for req in self.pipeline.calls], ["long v3", "queued v2"])
 
 
 class ModelSwitchTests(TestCase):

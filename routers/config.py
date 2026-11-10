@@ -298,6 +298,13 @@ _PRETRAINED_DIR = "GPT_SoVITS/pretrained_models"
 _NON_INFERENCE_PREFIXES = ("s2D",)
 _NON_INFERENCE_NAMES = {"vocoder.pth"}
 
+# GPT bases follow the host's pretrained_gpt_name, not the SoVITS version.
+_PRETRAINED_GPT_VERSIONS = {
+    "s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt": ("v1",),
+    "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt": ("v2",),
+    "s1v3.ckpt": ("v3", "v4", "v2Pro", "v2ProPlus", "v5dev", "v5turbo"),
+}
+
 
 def _scan_weights(
     root_map: dict, extensions: set, version: Optional[str] = None
@@ -325,8 +332,8 @@ def _scan_weights(
             if any(f.name.startswith(p) for p in _NON_INFERENCE_PREFIXES):
                 continue
             if version:
-                if extensions == {".ckpt"} and version in ("v5dev", "v5turbo"):
-                    if f.name != "s1v3.ckpt":
+                if extensions == {".ckpt"} and f.name in _PRETRAINED_GPT_VERSIONS:
+                    if version not in _PRETRAINED_GPT_VERSIONS[f.name]:
                         continue
                 elif _infer_pretrained_version(f) != version:
                     continue
@@ -487,6 +494,8 @@ _PRETRAINED_SUBDIR_VERSION = {
 
 def _infer_pretrained_version(filepath: Path) -> str:
     """根据文件所在子目录或文件名推断 pretrained 模型的版本"""
+    if filepath.name in _PRETRAINED_GPT_VERSIONS:
+        return _PRETRAINED_GPT_VERSIONS[filepath.name][0]
     if filepath.suffix.lower() == ".pth":
         from api_neko.backends.gsv_backend import sovits_model_version
         try:
@@ -642,12 +651,11 @@ def _scan_gsv_models() -> list[dict]:
     for version, sv_list in sovits_files.items():
         for sv in sv_list:
             if (version, sv["character"]) not in gpt_chars:
-                # Official V5 models share the host's s1v3 GPT base. Prefer a
+                # Use the host's compatible GPT base. Prefer a
                 # same-character fine-tuned GPT above; only fill the unpaired case.
-                shared_gpt = None
-                if version in ("v5dev", "v5turbo"):
-                    shared_gpt = next((g for group in gpt_files.values() for g in group
-                                       if g["filename"] == "s1v3.ckpt"), None)
+                shared_gpt = next((g for group in gpt_files.values() for g in group
+                                   if g["pretrained"] and version in
+                                   _PRETRAINED_GPT_VERSIONS.get(g["filename"], ())), None)
                 models.append(
                     {
                         "type": "pytorch",

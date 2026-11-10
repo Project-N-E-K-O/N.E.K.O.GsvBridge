@@ -75,6 +75,11 @@ class StaticAssetTests(TestCase):
                 self.assertEqual(client.get("/config/new").headers["cache-control"], "no-cache")
                 self.assertEqual(client.get("/config/new").status_code, 200)
                 self.assertEqual(client.get("/config/example").status_code, 200)
+                for voice_id in ("speaker.v5", "speaker.with.dots"):
+                    response = client.get(f"/config/{voice_id}")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.text, "<h1>spa</h1>")
+                    self.assertIn("text/html", response.headers["content-type"])
                 self.assertEqual(client.get("/unknown-page").status_code, 404)
                 self.assertEqual(client.get("/missing.js").status_code, 404)
                 self.assertEqual(client.get("/favicon.ico").status_code, 404)

@@ -20,6 +20,11 @@ const defaults = computed(() => modelDefaults(voice.value?.model.version));
 const modes = ref({ gpt: 'scan', sovits: 'scan', onnx: 'scan', audio: 'manual' });
 const weights = ref({ gpt: [], sovits: [], onnx: [], audio: [] });
 const scanning = ref({ gpt: false, sovits: false, onnx: false, audio: false });
+const scanRequests = { gpt: 0, sovits: 0, onnx: 0, audio: 0 };
+const modelReady = computed(() => backend.value !== 'gsv' || (
+  !scanning.value.gpt && !scanning.value.sovits
+  && voice.value?.model.gpt_weights.trim() && voice.value?.model.sovits_weights.trim()
+));
 const card = 'bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-4';
 const input = 'w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 px-3 py-1.5 text-sm';
 const label = 'block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1';
@@ -44,6 +49,7 @@ function choices(kind, current) {
 async function scan(kind, selectDefault = false) {
   if (!voice.value) return;
   const version = voice.value.model.version;
+  const request = ++scanRequests[kind];
   scanning.value[kind] = true;
   try {
     let response;
@@ -51,15 +57,16 @@ async function scan(kind, selectDefault = false) {
     else if (kind === 'sovits') response = await api.scanSovitsWeights(version);
     else if (kind === 'onnx') response = await api.scanOnnxDirs();
     else response = await api.scanAudio();
+    if (request !== scanRequests[kind]) return;
     if (voice.value.model.version !== version && (kind === 'gpt' || kind === 'sovits')) return;
     weights.value[kind] = response.files || response.dirs || [];
     if (selectDefault && (kind === 'gpt' || kind === 'sovits')) {
       voice.value.model[`${kind}_weights`] = preferredWeight(weights.value[kind], version, kind);
     }
   } catch (failure) {
-    error.value = failure?.data?.detail || failure.message;
+    if (request === scanRequests[kind]) error.value = failure?.data?.detail || failure.message;
   } finally {
-    scanning.value[kind] = false;
+    if (request === scanRequests[kind]) scanning.value[kind] = false;
   }
 }
 
@@ -86,6 +93,10 @@ async function save() {
   error.value = '';
   if (!voice.value.voice.id.trim()) {
     error.value = text('required');
+    return;
+  }
+  if (!modelReady.value) {
+    error.value = text('requiredWeights');
     return;
   }
   saving.value = true;
@@ -126,7 +137,7 @@ onMounted(async () => {
             class="px-3 py-1.5 text-xs font-medium rounded-md" :class="backend === value ? 'bg-white dark:bg-gray-600 text-purple-700 dark:text-purple-300 shadow-sm' : 'text-gray-500 dark:text-gray-400'"
             @click="setBackend(value)">{{ value === 'gsv' ? '🔥 GSV' : '⚡ Genie' }}</button>
         </div>
-        <button type="button" class="px-4 py-2 bg-indigo-600 text-white text-sm rounded-lg disabled:opacity-50" :disabled="saving || loading || !voice" data-testid="save-voice" @click="save">{{ t('common.save') }}</button>
+        <button type="button" class="px-4 py-2 bg-indigo-600 text-white text-sm rounded-lg disabled:opacity-50" :disabled="saving || loading || !voice || !modelReady" data-testid="save-voice" @click="save">{{ t('common.save') }}</button>
       </div>
     </div>
     <p v-if="error" role="alert" class="text-sm text-red-500">{{ error }}</p>
