@@ -509,6 +509,12 @@ async def tts_ws_stream_input(websocket: WebSocket):
                 raise ValueError(f"unknown cmd: {cmd}")
     except WebSocketDisconnect:
         pass
+    except asyncio.TimeoutError:
+        if not failed:
+            try:
+                await fail("session timeout")
+            except Exception:
+                pass
     except Exception as exc:
         if not failed:
             try:

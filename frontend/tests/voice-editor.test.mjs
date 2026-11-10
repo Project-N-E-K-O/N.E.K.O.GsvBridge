@@ -35,7 +35,7 @@ test('V5 weight selection uses the shared GPT and the selected acoustic model', 
 
 test('new UI controls have labels in every distributed language', () => {
   for (const locale of ['zh-CN', 'en', 'ja', 'ko']) {
-    for (const key of ['auto', 'autoValue', 'cfg', 'acceleration', 'versionHelp']) {
+    for (const key of ['auto', 'autoValue', 'cfg', 'acceleration', 'versionHelp', 'retainedHelp']) {
       assert.notEqual(editorText(locale, key), key);
     }
   }

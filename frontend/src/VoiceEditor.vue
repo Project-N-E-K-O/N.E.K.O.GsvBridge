@@ -221,12 +221,14 @@ onMounted(async () => {
               <label class="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 mb-2">
                 <input type="checkbox" :checked="voice.params[name] == null" :data-testid="`${name}-auto`" @change="automatic(name, $event.target.checked)">
                 <span>{{ text('auto') }}</span>
-                <span v-if="voice.params[name] == null" :data-testid="`${name}-default`">{{ text('autoValue') }}: {{ defaults[name] }}</span>
+                <span :data-testid="`${name}-default`">{{ text('autoValue') }}: {{ defaults[name] }}</span>
               </label>
               <ParamSlider v-if="voice.params[name] != null" v-model="voice.params[name]" :label="text('custom')" :min="name === 'sample_steps' ? 1 : 0" :max="name === 'sample_steps' ? 100 : 2" :step="name === 'sample_steps' ? 1 : 0.05" />
             </div>
           </div>
           <p class="text-xs text-gray-400">{{ text('autoHelp') }}</p>
+          <p v-if="['sample_steps', 'cfg_rate'].some(name => voice.params[name] != null && voice.params[name] !== defaults[name])"
+            class="text-xs text-gray-500 dark:text-gray-400" data-testid="retained-parameters">{{ text('retainedHelp') }}</p>
           <div v-if="backend === 'gsv'" class="space-y-2">
             <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wide">{{ text('acceleration') }}</h3>
             <label v-for="[name, key] in [['use_cuda_graph', 'cuda'], ['use_flash_attention', 'flash']]" :key="name" class="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400"><input :checked="voice.params[name]" type="checkbox" :data-testid="name" @change="voice.params[name] = $event.target.checked"><span>{{ text(key) }}</span></label>

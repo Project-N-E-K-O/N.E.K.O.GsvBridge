@@ -56,11 +56,20 @@ def _get_engine(request: Request):
     return request.app.state.inference_engine
 
 
+def _task_error_response(task):
+    if task.output.validation_error:
+        return JSONResponse(status_code=400, content={"message": task.output.validation_error})
+    return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": task.output.error})
+
+
 async def tts_handle(req: dict, engine):
     """TTS 推理核心处理函数"""
     streaming_mode = req.get("streaming_mode", False)
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
+    error = engine.validate_request(req)
+    if error:
+        return JSONResponse(status_code=400, content={"message": error})
 
     if streaming_mode == 0:
         streaming_mode = False
@@ -92,14 +101,13 @@ async def tts_handle(req: dict, engine):
     task = None
     response_owns_task = False
     try:
-        # v2 and v3 share the same worker. v2 captures the manually selected
-        # weights instead of whichever model a concurrent v3 request last used.
+        # Resolve the manual selection in queue order, independently of v3 voices.
         task = await engine.submit_selected(req, "raw" if streaming_mode and media_type == "wav" else media_type)
         if streaming_mode:
             while not task.output.done and not task.output.chunks:
                 await task.output.wait_for_update()
             if task.output.error and not task.output.chunks:
-                return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": task.output.error})
+                return _task_error_response(task)
             async def streaming_generator():
                 index = 0
                 try:
@@ -125,7 +133,7 @@ async def tts_handle(req: dict, engine):
         # Legacy v2 waits through queueing and synthesis without a server deadline.
         await task.output.wait_until_done(timeout=None)
         if task.output.error:
-            return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": task.output.error})
+            return _task_error_response(task)
         chunks = [chunk.data for chunk in task.output.chunks]
         audio_data = join_wav_chunks(chunks) if media_type == "wav" else b"".join(chunks)
         return Response(audio_data, media_type=f"audio/{media_type}")

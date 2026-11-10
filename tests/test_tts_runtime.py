@@ -17,7 +17,7 @@ import numpy as np
 
 from api_neko import config
 from api_neko.backends.gsv_backend import GSVPipeline
-from api_neko.inference import InferenceEngine, OutputBuffer, TaskStatus
+from api_neko.inference import AudioChunk, InferenceEngine, OutputBuffer, TaskStatus
 from api_neko.routers import tts, tts_v3
 
 
@@ -47,6 +47,9 @@ class FakePipeline:
 
     def validate_params(self, req):
         return None
+
+    def validate_request(self, req):
+        return self.validate_params(req)
 
     def get_model_paths(self):
         return self.model_paths
@@ -176,6 +179,78 @@ class EngineTests(IsolatedAsyncioTestCase):
         await finished(manual)
         self.assertEqual(self.pipeline.models_used, [("gpt-A", "A"), ("gpt-A", "A"), ("gpt-B", "B")])
 
+    async def test_queued_manual_selection_applies_to_later_v2_requests(self):
+        await self.engine.select_model_weights(gpt="gpt-B", sovits="sovits-B")
+        self.pipeline.release.clear()
+        first = await self.submit("blocking v3")
+        self.assertTrue(await asyncio.to_thread(self.pipeline.started.wait, 2))
+        selection = asyncio.create_task(self.engine.select_model_weights(sovits="sovits-X"))
+        await asyncio.sleep(0)
+        legacy = await self.engine.submit_selected({"text": "after switch"})
+        self.pipeline.release.set()
+        await selection
+        await finished(legacy)
+        await finished(first)
+        self.assertEqual(self.pipeline.models_used[-1], ("gpt-B", "sovits-X"))
+        self.assertEqual(self.engine._manual_weights, ("gpt-B", "sovits-X"))
+        self.assertEqual((self.engine._current_gpt, self.engine._current_sovits), self.engine._manual_weights)
+        last = self.pipeline.loads.index(("sovits", "sovits-X"))
+        self.assertNotIn(("sovits", "sovits-B"), self.pipeline.loads[last:])
+
+    async def test_v2_invalid_inputs_are_rejected_before_queueing_or_loading(self):
+        self.pipeline.release.clear()
+        first = await self.submit("blocking v3")
+        self.assertTrue(await asyncio.to_thread(self.pipeline.started.wait, 2))
+        self.engine._manual_weights = ("gpt-B", "sovits-B")
+        validator = GSVPipeline.__new__(GSVPipeline)
+        validator._cut_method_names = ["cut5"]
+        self.engine._validator = validator
+        valid = {"text": "hello", "ref_audio_path": "reference.wav", "media_type": "wav", "text_split_method": "cut5"}
+        before = list(self.pipeline.loads)
+        try:
+            for key, value, error in (("text", None, "text is required"),
+                                      ("ref_audio_path", "", "ref_audio_path is required"),
+                                      ("media_type", "invalid", "media_type: invalid is not supported"),
+                                      ("text_split_method", "invalid", "text_split_method: invalid is not supported")):
+                with self.subTest(field=key):
+                    response = await asyncio.wait_for(tts.tts_handle({**valid, key: value}, self.engine), 0.2)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(json.loads(response.body), {"message": error})
+            self.assertEqual(self.pipeline.loads, before)
+            self.assertEqual(self.engine._queue.qsize(), 0)
+        finally:
+            self.pipeline.release.set()
+            await finished(first)
+
+    async def test_worker_validation_keeps_v2_error_format(self):
+        self.pipeline.validate_request = Mock(return_value=None)
+        self.pipeline.validate_params = Mock(return_value="unsupported target language")
+        self.engine._manual_weights = ("gpt-B", "sovits-B")
+        response = await tts.tts_handle({"text": "hello"}, self.engine)
+        self.assertEqual(json.loads(response.body), {"message": "unsupported target language"})
+        self.assertIn(("sovits", "sovits-B"), self.pipeline.loads)
+
+    async def test_idle_stream_reports_the_existing_timeout_message(self):
+        events = []
+
+        class IdleSocket:
+            app = SimpleNamespace(state=SimpleNamespace(inference_engine=self.engine))
+
+            async def accept(self):
+                pass
+
+            async def receive_json(self):
+                raise asyncio.TimeoutError()
+
+            async def send_json(self, event):
+                events.append(event)
+
+            async def close(self):
+                pass
+
+        await tts_v3.tts_ws_stream_input(IdleSocket())
+        self.assertEqual(events, [{"type": "error", "message": "session timeout"}])
+
     async def test_v2_inference_cannot_overlap_the_v3_worker(self):
         self.pipeline.release.clear()
         first = await self.submit("v3")
@@ -190,12 +265,29 @@ class EngineTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.pipeline.max_active, 1)
 
     async def test_output_deadline_does_not_count_update_notifications_as_seconds(self):
-        self.pipeline.fragments = 35
-        self.pipeline.delay = 0.01
-        task = await self.submit()
-        self.assertFalse(await task.output.wait_until_done(timeout=0.02))
-        self.assertTrue(await task.output.wait_until_done(timeout=2))
-        self.assertEqual(len(task.output.chunks), 35)
+        output = OutputBuffer()
+        self.assertFalse(await output.wait_until_done(timeout=0.02))
+        consumed = asyncio.Queue()
+        original_update = output.wait_for_update
+
+        async def tracked_update(timeout=30):
+            result = await original_update(timeout)
+            await consumed.put(True)
+            return result
+
+        output.wait_for_update = tracked_update
+        waiting = asyncio.create_task(output.wait_until_done(timeout=5))
+        try:
+            for index in range(35):
+                output.add_chunk(AudioChunk(index, b"audio", 48000))
+                await asyncio.wait_for(consumed.get(), timeout=2)
+            self.assertFalse(waiting.done())
+            output.mark_done()
+            self.assertTrue(await waiting)
+            self.assertEqual(len(output.chunks), 35)
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
 
     async def test_v2_waits_past_the_default_output_deadline_while_queued(self):
         original_wait = OutputBuffer.wait_until_done

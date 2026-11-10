@@ -19,7 +19,8 @@ prompt_lang = "all_zh"
 text_lang = "all_zh"
 use_cuda_graph = true
 use_flash_attention = true
-# sample_steps and cfg_rate are omitted to follow host/model defaults.
+sample_steps = "auto"
+cfg_rate = "auto"
 
 [output]
 media_type = "wav"

@@ -42,6 +42,7 @@ class OutputBuffer:
     chunks: list[AudioChunk] = field(default_factory=list)
     done: bool = False
     error: Optional[str] = None
+    validation_error: Optional[str] = None
     # asyncio.Event 用于通知有新 chunk 到达或任务完成
     # 注意：必须在事件循环中创建
     _notify: Optional[asyncio.Event] = field(default=None, repr=False)
@@ -111,6 +112,7 @@ class InferTask:
     pcm48_wav: bool = False
     retain_result: bool = True
     model_only: bool = False
+    use_manual: bool = False
     cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
     release_when_done: bool = False
     # 输出缓冲区（自动创建）
@@ -183,6 +185,9 @@ class InferenceEngine:
         """校验 TTS 请求参数，委托给 pipeline 后端的 validate_params"""
         return self._validator.validate_params(req)
 
+    def validate_request(self, req: dict) -> Optional[str]:
+        return self._validator.validate_request(req)
+
     async def submit(
         self,
         voice_id: str,
@@ -194,6 +199,7 @@ class InferenceEngine:
         pcm48_wav: bool = False,
         retain_result: bool = True,
         model_only: bool = False,
+        use_manual: bool = False,
     ) -> InferTask:
         """提交推理任务，返回 InferTask（含 task_id 和 output buffer）"""
         task_id = self._next_id()
@@ -208,6 +214,7 @@ class InferenceEngine:
             pcm48_wav=pcm48_wav,
             retain_result=retain_result,
             model_only=model_only,
+            use_manual=use_manual,
         )
         self._tasks[task_id] = task
         self._prune_completed_tasks()
@@ -215,10 +222,9 @@ class InferenceEngine:
         return task
 
     async def submit_selected(self, tts_params: dict, media_type: str = "wav") -> InferTask:
-        """Snapshot the manually selected pair so v3 requests cannot replace it."""
-        gpt, sovits = self._manual_weights
-        return await self.submit("_manual", gpt, sovits, tts_params,
-                                 media_type=media_type, retain_result=False)
+        """Resolve manual weights at execution, after earlier queued selections."""
+        return await self.submit("_manual", "", "", tts_params,
+                                 media_type=media_type, retain_result=False, use_manual=True)
 
     async def select_model_weights(self, *, gpt: str = "", sovits: str = ""):
         """Serialize manual model selection with every other pipeline operation."""
@@ -310,6 +316,8 @@ class InferenceEngine:
         if task.model_only:
             gpt = gpt or self._manual_weights[0]
             sovits = sovits or self._manual_weights[1]
+        elif task.use_manual:
+            gpt, sovits = self._manual_weights
         need_gpt = gpt and gpt != self._current_gpt
         need_sovits = sovits and sovits != self._current_sovits
 
@@ -333,6 +341,7 @@ class InferenceEngine:
             return
         error = self.validate_params({**task.tts_params, "media_type": task.media_type})
         if error:
+            task.output.validation_error = error
             raise ValueError(error)
 
         # 2. 推理

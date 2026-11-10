@@ -47,9 +47,19 @@ class VoiceEditorBrowserTests(TestCase):
             with patch.object(config, "VOICES_DIR", voices), \
                     patch.object(config, "PROJECT_ROOT", root), \
                     patch.object(config, "SETTINGS_PATH", root / "settings.toml"), \
-                    patch.object(config, "_default_data_cache", {}), \
+                    patch.object(config, "_default_data_cache", {"params": {"sample_steps": 32, "cfg_rate": 0.75}}), \
                     patch.object(config_router, "_PROJECT_ROOT", root), \
                     patch("api_neko.backends.gsv_backend.sovits_model_version", side_effect=ImportError):
+                legacy = config.VoiceConfig()
+                legacy.voice.id = "legacy-explicit"
+                legacy.model.version = "v3"
+                legacy.model.gpt_weights = str(pretrained / "s1v3.ckpt")
+                legacy.model.sovits_weights = "legacy-s2Gv3.pth"
+                legacy.ref_audio.path = str(reference)
+                legacy.ref_audio.prompt_text = "Public test transcript"
+                legacy.params.sample_steps = 32
+                legacy.params.cfg_rate = 0
+                config.save_voice(legacy)
                 listener = socket.socket()
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
@@ -148,6 +158,27 @@ class VoiceEditorBrowserTests(TestCase):
                             saved = config.load_voice("browser-dev")
                             self.assertEqual(saved.params.sample_steps, 12)
                             self.assertEqual(saved.params.cfg_rate, 0.9)
+
+                            # A numeric value cannot reveal whether the user
+                            # deliberately chose the old model's default.
+                            page.goto(base + "/config/legacy-explicit")
+                            expect(page.get_by_test_id("model-version")).to_have_value("v3", timeout=30000)
+                            page.get_by_test_id("model-version").select_option("v5turbo")
+                            expect(page.get_by_test_id("save-voice")).to_be_enabled()
+                            expect(page.get_by_test_id("sample_steps-auto")).not_to_be_checked()
+                            expect(page.get_by_test_id("sample_steps-control").locator('input[type="number"]')).to_have_value("32")
+                            expect(page.get_by_test_id("sample_steps-default")).to_contain_text("4")
+                            expect(page.get_by_test_id("retained-parameters")).to_be_visible()
+                            page.get_by_test_id("sample_steps-auto").check()
+                            page.get_by_test_id("cfg_rate-auto").check()
+                            page.get_by_test_id("save-voice").click()
+                            expect(page).to_have_url(base + "/config")
+                            page.goto(base + "/config/legacy-explicit")
+                            expect(page.get_by_test_id("sample_steps-auto")).to_be_checked(timeout=30000)
+                            expect(page.get_by_test_id("cfg_rate-auto")).to_be_checked()
+                            saved = config.load_voice("legacy-explicit")
+                            self.assertIsNone(saved.params.sample_steps)
+                            self.assertIsNone(saved.params.cfg_rate)
                             self.assertEqual(errors, [])
                             screenshot = os.environ.get("GSV_BROWSER_SCREENSHOT")
                             if screenshot:

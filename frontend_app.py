@@ -77,6 +77,12 @@ class FrontendApp:
             return
 
         extension = Path(request_path).suffix
+        if request_path in ("/tts", "/config", "/models") and (self.directory / normalized_path / "index.html").is_file():
+            # Serve known prerendered pages directly, preserving StaticFiles'
+            # conditional/range handling without its directory redirect.
+            path = request_path + "/"
+            scope = {**scope, "path": path, "raw_path": path.encode()}
+            extension = ".html"
         fallback_sent = False
 
         async def send_response(message):
@@ -92,7 +98,17 @@ class FrontendApp:
                         )
                         return
 
-                if status in (200, 206, 304) and extension:
+                multipart_type = next((value for name, value in message["headers"]
+                                       if name.lower() in (b"content-type", b"content-range")
+                                       and value.lower().startswith(b"multipart/byteranges")), None)
+                if multipart_type is not None:
+                    # Starlette 0.40 (the bundled host) placed this value in
+                    # Content-Range. Newer releases correctly use Content-Type.
+                    headers = [(name, value) for name, value in message["headers"]
+                               if name.lower() not in (b"content-type", b"content-range")]
+                    message = {**message, "headers": [*headers, (b"content-type", multipart_type)]}
+                multipart = multipart_type is not None
+                if status in (200, 206, 304) and extension and not multipart:
                     headers = [
                         (name, value)
                         for name, value in message["headers"]
@@ -103,7 +119,7 @@ class FrontendApp:
                     )
                     message = {**message, "headers": headers}
                 if status in (200, 206, 304) and (
-                    extension in (".js", ".mjs", ".html")
+                    extension == ".html"
                     or any(name.lower() == b"content-type" and value.startswith(b"text/html")
                            for name, value in message["headers"])
                 ):

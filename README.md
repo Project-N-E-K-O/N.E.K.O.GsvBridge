@@ -167,8 +167,10 @@ Bridge 继续使用原有 `/api/v3/voices` 和 `/api/v3/tts/stream-input`，NEKO
 - 支持 `use_cuda_graph`、`use_flash_attention`，默认启用，实际可用能力由宿主决定。
   上述 V5 参数适用于声音配置、v3 REST、两个 v3 WebSocket 入口和 v2 的 GET/POST。
 - 参数优先级为请求显式覆盖 → 声音配置（含 `voices/default.toml` 公共默认值）→ 宿主默认。
-  请求 JSON 可用 `null` 临时恢复 `sample_steps` / `cfg_rate` 的宿主默认；保存声音时省略自动值，
-  因为 TOML 没有 null。重新读取时仍先合并公共默认配置。旧编辑器未提交的新字段保留原值。
+  请求 JSON 用 `null` 表示 `sample_steps` / `cfg_rate` 的宿主默认。TOML 用 `"auto"` 保存显式自动值，
+  即使公共默认配置有数字也不会覆盖它；旧文件省略的键仍继承公共默认配置。显式数字继续生效，
+  旧编辑器未提交的新字段保留原值。版本切换不会通过数值猜测用户意图并重置显式参数；
+  编辑页同时展示保留值与新模型默认值，用户可选择切换为自动。
 - 通用示例位于 [`examples/voices/v5turbo.toml`](examples/voices/v5turbo.toml) 和
   [`examples/voices/v5dev.toml`](examples/voices/v5dev.toml)，不会自动注册为可用音色。
   需要用户在本机补充参考音频及准确文本，再通过配置 API 创建或复制到 `voices/`。
@@ -203,11 +205,16 @@ CUDA Graph 和 FlashAttention 可以独立选择。保存并重新打开后保�
 - 流式任务完成/断连后释放任务和音频；REST 默认保留最近 100 个完成任务，较旧 ID 返回 404。
   模型切换使参考音频缓存失效，使用相同参考音频路径也会重新提取特征。
 - v2 推理和手动模型切换也进入同一 Worker 队列；手动选择的权重与 v3 当前模型独立维护。
-  v3 请求不会继承管理页面临时切换的模型，v2 也会恢复自己的选定权重。
+  v2 在任务执行时读取前面排队的手动选择，v3 请求不会改变这个选择。
+  v2 的模型无关参数在入队前检查，校验失败保持 `400 {"message": err}`，不排队或加载权重；
+  语言等依赖目标版本的检查保留在 Worker 中，失败时保持相同错误格式。
   下载完整音频使用真实截止时间，连续音频更新不会被误计为等待超时。
 
 本次兼容保持按文本段推理。`streaming_mode` / `return_fragment` 会传递给宿主，实际输出能力
 取决于宿主；仅新增参数不能恢复宿主缺失的 `gpt_streaming` 语义 token 流式。
+相对旧版 v3 强制关闭 `streaming_mode` 的行为，本次有意让配置中的该开关生效；已有声音勾选
+该选项时也会使用宿主支持的段内流式/分片路径。这是兼容行为变化，和 Bridge 按文本段提交任务
+属于不同层次。`return_fragment` 原先已透传，保持不变。
 NEKO 的连接测试约 10 秒超时、收到部分音频后仍可能判成功，以及 `init` 与 `_default` 的
 默认 ID 差异仍是客户端既有行为。Bridge 不通过改写 `init` 音色或伪造成功来绕过这些条件。
 
@@ -220,6 +227,9 @@ python -m pytest tests -q
 ```
 
 默认测试使用临时目录、模拟后端和进程内 WebSocket，不需要本机音色、模型、GPU 或监听端口。
+pytest 通过 `tests/conftest.py` 将包注册到当前 checkout，支持默认的 `N.E.K.O.GsvBridge`
+克隆目录名，不需要设置 `PYTHONPATH`。直接 `unittest discover` 不读取 conftest，下面的标准库
+真实宿主测试命令要求仓库位于宿主下并命名为 `api_neko`；普通独立克隆使用上面的 pytest 命令。
 编辑页还有 Node 状态测试和可选隔离浏览器验收，运行方法见 `frontend/README.md`。
 可选真实宿主测试通过 `GSV_TEST_HOST_ROOT` 指定宿主位置，使用仓库已有公共参考音频和临时
 推理配置，验证 V2ProPlus → Turbo → Dev → V2ProPlus 的协议与模型切换；不改写用户配置。

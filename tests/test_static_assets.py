@@ -70,7 +70,7 @@ class StaticAssetTests(TestCase):
                     "application/json",
                 )
                 self.assertEqual(client.get("/api/v3/health").status_code, 200)
-                self.assertEqual(client.get("/app.js").headers["cache-control"], "no-cache")
+                self.assertNotIn("cache-control", client.get("/app.js").headers)
                 self.assertEqual(client.get("/").headers["cache-control"], "no-cache")
                 self.assertEqual(client.get("/config/new").headers["cache-control"], "no-cache")
                 self.assertEqual(client.get("/config/new").status_code, 200)
@@ -88,6 +88,36 @@ class StaticAssetTests(TestCase):
                 for path in ("/..%2Fserver.py", "/%2e%2e/server.py", "/a%00b"):
                     with self.subTest(path=path):
                         self.assertEqual(client.get(path).status_code, 404)
+
+    def test_html_revalidates_but_hashed_assets_keep_normal_conditional_caching(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "index.html").write_text("<h1>root</h1>", encoding="utf-8")
+            for page in ("tts", "config", "models"):
+                (root / page).mkdir()
+                (root / page / "index.html").write_text(f"<h1>{page}</h1>", encoding="utf-8")
+            (root / "asset.abc123.js").write_text("const data = '" + "0123456789" * 30 + "';", encoding="utf-8")
+            app = Starlette()
+            app.mount("/", FrontendApp(root))
+            with TestClient(app) as client:
+                for path in ("/tts", "/config", "/models"):
+                    response = client.get(path, follow_redirects=False)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers["cache-control"], "no-cache")
+                    self.assertNotIn("location", response.headers)
+                asset = client.get("/asset.abc123.js")
+                self.assertNotIn("cache-control", asset.headers)
+                conditional = client.get("/asset.abc123.js", headers={"If-None-Match": asset.headers["etag"]})
+                self.assertEqual(conditional.status_code, 304)
+                multipart = client.get("/asset.abc123.js", headers={"Range": "bytes=0-3,100-103"})
+                self.assertEqual(multipart.status_code, 206)
+                self.assertTrue(multipart.headers["content-type"].startswith("multipart/byteranges; boundary="))
+                boundary = multipart.headers["content-type"].split("boundary=", 1)[1].strip('"')
+                self.assertIn(boundary.encode(), multipart.content)
+                self.assertIn(b"Content-Range: bytes 0-3/", multipart.content)
+                single = client.get("/asset.abc123.js", headers={"Range": "bytes=0-3"})
+                self.assertEqual(single.status_code, 206)
+                self.assertEqual(single.headers["content-type"], "text/javascript; charset=utf-8")
 
     def test_static_response_is_not_affected_by_global_registry_mapping(self):
         previous = mimetypes.types_map.get(".js")

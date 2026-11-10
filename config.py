@@ -207,7 +207,8 @@ def _dict_to_voice_config(data: dict) -> VoiceConfig:
         p = data["params"]
         defaults = InferParams()
         cfg.params = InferParams(**{
-            k: p.get(k, getattr(defaults, k))
+            k: None if k in ("sample_steps", "cfg_rate") and p.get(k) == "auto"
+            else p.get(k, getattr(defaults, k))
             for k in defaults.__dataclass_fields__
         })
 
@@ -312,8 +313,11 @@ def save_voice(config: VoiceConfig, path: Optional[str | Path] = None) -> Path:
         "params": asdict(config.params),
         "output": asdict(config.output),
     }
-    # TOML has no null; omitted optional values restore host defaults on reload.
-    data["params"] = {key: value for key, value in data["params"].items() if value is not None}
+    # Explicit auto overrides numeric values inherited from default.toml. Older
+    # files with omitted keys keep their existing shared-default inheritance.
+    for key in ("sample_steps", "cfg_rate"):
+        if data["params"][key] is None:
+            data["params"][key] = "auto"
 
     a = str(Path(config.ref_audio.path))
     b = str(Path(config.model.gpt_weights))

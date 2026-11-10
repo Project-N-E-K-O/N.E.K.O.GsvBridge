@@ -82,25 +82,28 @@ class GSVPipeline(BasePipeline):
             supports_streaming=True,
         )
 
-    def validate_params(self, req: dict) -> Optional[str]:
-        """使用原项目的校验逻辑"""
-        text = req.get("text", "")
-        text_lang = req.get("text_lang", "")
-        ref_audio_path = req.get("ref_audio_path", "")
-        prompt_lang = req.get("prompt_lang", "")
-        media_type = req.get("media_type", "wav")
+    def validate_request(self, req: dict) -> Optional[str]:
+        error = super().validate_request(req)
+        if error:
+            return error
         text_split_method = req.get("text_split_method", "cut5")
-        version = req.get("model_version", self._tts_config.version)
-        languages = self._tts_config.v1_languages if version == "v1" else self._tts_config.v2_languages
-
-        if not ref_audio_path:
-            return "ref_audio_path is required"
-        if not text:
-            return "text is required"
         if req.get("sample_steps") is not None and req["sample_steps"] < 1:
             return "sample_steps must be positive"
         if req.get("cfg_rate") is not None and req["cfg_rate"] < 0:
             return "cfg_rate must be non-negative"
+        if text_split_method not in self._cut_method_names:
+            return f"text_split_method: {text_split_method} is not supported"
+        return None
+
+    def validate_params(self, req: dict) -> Optional[str]:
+        """Check languages and reference text against the target model."""
+        error = self.validate_request(req)
+        if error:
+            return error
+        text_lang = req.get("text_lang", "")
+        prompt_lang = req.get("prompt_lang", "")
+        version = req.get("model_version", self._tts_config.version)
+        languages = self._tts_config.v1_languages if version == "v1" else self._tts_config.v2_languages
         if version in ("v3", "v4", "v5dev", "v5turbo") and not req.get("prompt_text", "").strip():
             return "prompt_text is required for V3/V4/V5"
         if not text_lang:
@@ -111,8 +114,4 @@ class GSVPipeline(BasePipeline):
             return "prompt_lang is required"
         if prompt_lang.lower() not in languages:
             return f"prompt_lang: {prompt_lang} is not supported in version {version}"
-        if media_type not in ("wav", "raw", "ogg", "aac"):
-            return f"media_type: {media_type} is not supported"
-        if text_split_method not in self._cut_method_names:
-            return f"text_split_method: {text_split_method} is not supported"
         return None

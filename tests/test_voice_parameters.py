@@ -29,7 +29,7 @@ class VoiceParametersTests(TestCase):
         voice.params.use_cuda_graph = False
         path = config.save_voice(voice)
         text = path.read_text(encoding="utf-8")
-        self.assertNotIn("sample_steps =", text)
+        self.assertIn('sample_steps = "auto"', text)
         self.assertNotIn('"None"', text)
         loaded = config.load_voice("example")
         self.assertIsNone(loaded.params.sample_steps)
@@ -38,6 +38,23 @@ class VoiceParametersTests(TestCase):
         loaded.params.sample_steps = 32
         config.save_voice(loaded)
         self.assertEqual(config.load_voice("example").params.sample_steps, 32)
+
+    def test_explicit_auto_overrides_shared_defaults_and_survives_reload(self):
+        voice = config.VoiceConfig()
+        voice.voice.id = "automatic"
+        voice.ref_audio.path = "references/example.wav"
+        with patch.object(config, "_default_data_cache", {"params": {"sample_steps": 32, "cfg_rate": 0.75}}):
+            path = config.save_voice(voice)
+            loaded = config.load_voice("automatic")
+            self.assertIsNone(loaded.params.sample_steps)
+            self.assertIsNone(loaded.params.cfg_rate)
+            config.save_voice(loaded)
+            self.assertIsNone(config.load_voice("automatic").params.sample_steps)
+            # Omission retains the old inheritance semantics for untouched files.
+            path.write_text('[voice]\nid="automatic"\n', encoding="utf-8")
+            inherited = config.load_voice("automatic")
+            self.assertEqual(inherited.params.sample_steps, 32)
+            self.assertEqual(inherited.params.cfg_rate, 0.75)
 
     def test_all_request_forms_can_override_v5_parameters(self):
         voice = config.VoiceConfig()

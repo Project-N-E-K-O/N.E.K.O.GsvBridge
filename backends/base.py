@@ -67,17 +67,20 @@ class BasePipeline(ABC):
         """获取后端信息"""
         ...
 
-    def validate_params(self, req: dict) -> Optional[str]:
-        """校验推理参数，返回错误信息或 None
-
-        子类可覆盖此方法以添加后端特定的校验逻辑。
-        默认实现只检查必填字段。
-        """
-        if not req.get("text"):
-            return "text is required"
+    def validate_request(self, req: dict) -> Optional[str]:
+        """Check model-independent inputs before queueing or loading weights."""
         if not req.get("ref_audio_path"):
             return "ref_audio_path is required"
+        if not req.get("text"):
+            return "text is required"
+        media_type = req.get("media_type", "wav")
+        if media_type not in ("wav", "raw", "ogg", "aac"):
+            return f"media_type: {media_type} is not supported"
         return None
+
+    def validate_params(self, req: dict) -> Optional[str]:
+        """Validate inputs against the model actually loaded by the worker."""
+        return self.validate_request(req)
 
     def stop(self) -> None:
         """Request cooperative cancellation of the active call, when supported."""
