@@ -18,13 +18,16 @@ import numpy as np
 from api_neko import config
 from api_neko.backends.gsv_backend import GSVPipeline
 from api_neko.inference import InferenceEngine
-from api_neko.routers import tts_v3
+from api_neko.routers import tts, tts_v3
 
 
 @skipUnless(os.environ.get("GSV_TEST_HOST_ROOT"), "set GSV_TEST_HOST_ROOT for real GPU inference")
 class HostIntegrationTests(TestCase):
     def test_model_switches_keep_the_existing_neko_protocol(self):
         import yaml
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is unavailable in this test process; GPU regression was not run")
         host = Path(os.environ["GSV_TEST_HOST_ROOT"]).resolve()
         repository = Path(__file__).resolve().parents[1]
         old_cwd = Path.cwd()
@@ -67,6 +70,7 @@ class HostIntegrationTests(TestCase):
                 app.state.inference_engine = engine
                 app.state.backend_name = "gsv"
                 app.include_router(tts_v3.router)
+                app.include_router(tts.router)
 
                 def voice_for(version):
                     data = deepcopy(public)
@@ -103,6 +107,23 @@ class HostIntegrationTests(TestCase):
                         self.assertTrue(np.any(audio))
                         self.assertEqual(len(engine._tasks), 0)
                         print(json.dumps({"profile": version, "pcm_samples": int(audio.size), "sample_rate": 48000}))
+                        if version == "v5dev":
+                            # Simulate the model-management page selecting Turbo.
+                            # The next v3 request still asks for V2ProPlus.
+                            selected = client.get("/api/v2/set_sovits_weights", params={"weights_path": str(models["v5turbo"])})
+                            self.assertEqual(selected.status_code, 200)
+                    legacy = client.post("/api/v2/tts", json={
+                        "text": "模型兼容性测试。", "text_lang": "all_zh", "ref_audio_path": str(reference),
+                        "prompt_text": public["ref_audio"]["prompt_text"],
+                        "prompt_lang": public["ref_audio"]["prompt_lang"], "seed": 12345,
+                    })
+                    self.assertEqual(legacy.status_code, 200)
+                    self.assertEqual(pipeline.get_info().version, "v5turbo")
+                    with wave.open(BytesIO(legacy.content), "rb") as reader:
+                        self.assertEqual(reader.getframerate(), 48000)
+                        self.assertGreater(reader.getnframes(), 0)
+                    self.assertEqual(len(engine._tasks), 0)
+                    print(json.dumps({"profile": "v2-manual-turbo-after-v3", "sample_rate": 48000, "restored_selection": True}))
         finally:
             os.chdir(old_cwd)
             sys.path[:] = old_path

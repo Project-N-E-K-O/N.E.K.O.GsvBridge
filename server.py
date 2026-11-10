@@ -170,7 +170,7 @@ if _FRONTEND_DIST.is_dir():
     )
 else:
     print(f"[warning] 前端静态文件目录不存在: {_FRONTEND_DIST}")
-    print("[warning] 请先在 api_neko/frontend/ 下执行 npx nuxt generate 构建前端")
+    print("[warning] 请恢复仓库中的 frontend/.output/public 分发文件，编辑页构建方法见 frontend/README.md")
 
 
 def main():

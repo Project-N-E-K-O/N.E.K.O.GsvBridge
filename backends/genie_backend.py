@@ -200,6 +200,9 @@ class GeniePipeline(BasePipeline):
     def stop(self) -> None:
         self._tts_client.stop_event.set()
 
+    def get_model_paths(self) -> tuple[str, str]:
+        return "", self._current_model_dir
+
     def init_vits_weights(self, path: str) -> None:
         """加载 ONNX 模型目录
 

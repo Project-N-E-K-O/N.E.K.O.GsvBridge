@@ -1,0 +1,12 @@
+{
+  "entry": "voice-editor.60789f2fe9ad.js",
+  "legacyRoute": "C-I8AjUq.js",
+  "inputs": [
+    "src/VoiceEditor.vue",
+    "src/voice-editor.js",
+    "src/nuxt-runtime.js",
+    "scripts/build.mjs",
+    "package-lock.json"
+  ],
+  "sourceSHA256": "f79768285e1b84bc431ba2c97533d33f63da6772565f458f666dd0bed5604b87"
+}

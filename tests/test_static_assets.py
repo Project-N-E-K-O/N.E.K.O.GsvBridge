@@ -1,4 +1,7 @@
 import mimetypes
+import hashlib
+import json
+import re
 import tempfile
 from pathlib import Path
 from unittest import TestCase
@@ -12,6 +15,26 @@ from api_neko.frontend_app import FRONTEND_MEDIA_TYPES, FrontendApp, frontend_me
 
 
 class StaticAssetTests(TestCase):
+    def test_distributed_voice_editor_matches_source_and_every_html_entry(self):
+        frontend = Path(__file__).resolve().parents[1] / "frontend"
+        public = frontend / ".output/public"
+        manifest = json.loads((public / "_nuxt/voice-editor-manifest.json").read_text(encoding="utf-8"))
+        content = (public / "_nuxt" / manifest["entry"]).read_text(encoding="utf-8")
+        fingerprint = hashlib.sha256(content.encode()).hexdigest()[:12]
+        self.assertEqual(manifest["entry"], f"voice-editor.{fingerprint}.js")
+        source = hashlib.sha256()
+        for name in manifest["inputs"]:
+            source.update((frontend / name).read_text(encoding="utf-8").encode())
+        self.assertEqual(source.hexdigest(), manifest["sourceSHA256"])
+        self.assertIn("v5dev", content)
+        self.assertIn("v5turbo", content)
+        for html in public.rglob("*.html"):
+            with self.subTest(page=html.relative_to(public)):
+                found = re.search(r'<script type="importmap" data-gsv-voice-editor>(.*?)</script>', html.read_text(encoding="utf-8"))
+                self.assertIsNotNone(found)
+                mapping = json.loads(found.group(1))["imports"]
+                self.assertEqual(mapping["/_nuxt/" + manifest["legacyRoute"]], "/_nuxt/" + manifest["entry"])
+
     def test_frontend_media_types_are_explicit(self):
         for suffix, media_type in FRONTEND_MEDIA_TYPES.items():
             with self.subTest(suffix=suffix):
@@ -47,6 +70,9 @@ class StaticAssetTests(TestCase):
                     "application/json",
                 )
                 self.assertEqual(client.get("/api/v3/health").status_code, 200)
+                self.assertEqual(client.get("/app.js").headers["cache-control"], "no-cache")
+                self.assertEqual(client.get("/").headers["cache-control"], "no-cache")
+                self.assertEqual(client.get("/config/new").headers["cache-control"], "no-cache")
                 self.assertEqual(client.get("/config/new").status_code, 200)
                 self.assertEqual(client.get("/config/example").status_code, 200)
                 self.assertEqual(client.get("/unknown-page").status_code, 404)

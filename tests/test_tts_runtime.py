@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
@@ -32,21 +33,30 @@ class FakePipeline:
         self.fragments = 1
         self.active = 0
         self.max_active = 0
+        self.delay = 0
+        self.model_paths = ("", "")
+        self.models_used = []
 
     def init_t2s_weights(self, path):
         self.loads.append(("gpt", path))
+        self.model_paths = path, self.model_paths[1]
 
     def init_vits_weights(self, path):
         self.loads.append(("sovits", path))
+        self.model_paths = self.model_paths[0], path
 
     def validate_params(self, req):
         return None
+
+    def get_model_paths(self):
+        return self.model_paths
 
     def stop(self):
         self.stop_calls += 1
 
     def run(self, req):
         self.calls.append(dict(req))
+        self.models_used.append(self.model_paths)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.started.set()
@@ -56,6 +66,8 @@ class FakePipeline:
             if self.fail:
                 raise ValueError("synthesis failed")
             for _ in range(self.fragments):
+                if self.delay:
+                    time.sleep(self.delay)
                 yield 32000, np.full(3200, 1200, dtype=np.int16)
         finally:
             self.active -= 1
@@ -153,6 +165,37 @@ class EngineTests(IsolatedAsyncioTestCase):
         self.assertEqual(recovered.status, TaskStatus.DONE)
         self.assertEqual(self.pipeline.loads.count(("sovits", "sovits")), 2)
         self.assertEqual(self.pipeline.loads.count(("gpt", "gpt")), 2)
+
+    async def test_manual_model_selection_and_v3_keep_their_own_weights(self):
+        first = await self.engine.submit("A", "gpt-A", "A", {"text": "first"})
+        await finished(first)
+        await self.engine.select_model_weights(gpt="gpt-B", sovits="B")
+        second = await self.engine.submit("A", "gpt-A", "A", {"text": "second"})
+        await finished(second)
+        manual = await self.engine.submit_selected({"text": "manual"})
+        await finished(manual)
+        self.assertEqual(self.pipeline.models_used, [("gpt-A", "A"), ("gpt-A", "A"), ("gpt-B", "B")])
+
+    async def test_v2_inference_cannot_overlap_the_v3_worker(self):
+        self.pipeline.release.clear()
+        first = await self.submit("v3")
+        self.assertTrue(await asyncio.to_thread(self.pipeline.started.wait, 2))
+        legacy = asyncio.create_task(tts.tts_handle({"text": "v2", "streaming_mode": False, "media_type": "wav"}, self.engine))
+        await asyncio.sleep(0.03)
+        self.assertFalse(legacy.done())
+        self.assertEqual(len(self.pipeline.calls), 1)
+        self.pipeline.release.set()
+        self.assertEqual((await legacy).status_code, 200)
+        await finished(first)
+        self.assertEqual(self.pipeline.max_active, 1)
+
+    async def test_output_deadline_does_not_count_update_notifications_as_seconds(self):
+        self.pipeline.fragments = 35
+        self.pipeline.delay = 0.01
+        task = await self.submit()
+        self.assertFalse(await task.output.wait_until_done(timeout=0.02))
+        self.assertTrue(await task.output.wait_until_done(timeout=2))
+        self.assertEqual(len(task.output.chunks), 35)
 
 
 class ModelSwitchTests(TestCase):
@@ -328,3 +371,39 @@ class ProtocolTests(TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIsNone(self.pipeline.calls[-1]["sample_steps"])
             self.assertIs(self.pipeline.calls[-1]["use_cuda_graph"], False)
+
+    def test_many_rest_fragments_do_not_trigger_a_premature_120_second_timeout(self):
+        self.pipeline.fragments = 35
+        self.pipeline.delay = 0.01
+        response = self.client.post("/api/v3/tts", json={"text": "many fragments", "voice_id": self.voice.voice.id})
+        result = self.client.get(f"/api/v3/tts/{response.json()['task_id']}/audio")
+        self.assertEqual(result.status_code, 200)
+        with wave.open(BytesIO(result.content), "rb") as reader:
+            self.assertEqual(reader.getnframes(), 35 * 3200)
+
+    def test_manual_weight_endpoint_keeps_v3_model_identity_consistent(self):
+        selected = self.client.get("/api/v2/set_sovits_weights", params={"weights_path": "model-B"})
+        self.assertEqual(selected.status_code, 200)
+        self.voice.model.sovits_weights = "model-A"
+        response = self.client.post("/api/v3/tts", json={"text": "model A", "voice_id": self.voice.voice.id})
+        self.assertEqual(self.client.get(f"/api/v3/tts/{response.json()['task_id']}/audio").status_code, 200)
+        self.assertEqual(self.pipeline.models_used[-1][1], "model-A")
+        response = self.client.post("/api/v2/tts", json={"text": "manual B"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.pipeline.models_used[-1][1], "model-B")
+
+    def test_v2_stream_keeps_one_wav_header_and_cleans_its_task(self):
+        self.pipeline.fragments = 2
+        result = self.client.post("/api/v2/tts", json={"text": "stream", "streaming_mode": 1, "media_type": "wav"})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.content[:4], b"RIFF")
+        self.assertEqual(result.content.count(b"RIFF"), 1)
+        self.assertEqual(len(result.content), 44 + 2 * 3200 * 2)
+        self.assertEqual(len(self.engine._tasks), 0)
+
+    def test_v2_stream_reports_failure_before_sending_audio_headers(self):
+        self.pipeline.fail = True
+        result = self.client.post("/api/v2/tts", json={"text": "fail", "streaming_mode": 1})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("synthesis failed", result.json()["Exception"])
+        self.assertEqual(len(self.engine._tasks), 0)

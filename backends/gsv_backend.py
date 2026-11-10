@@ -71,6 +71,9 @@ class GSVPipeline(BasePipeline):
     def stop(self) -> None:
         self._tts.stop()
 
+    def get_model_paths(self) -> tuple[str, str]:
+        return self._tts_config.t2s_weights_path, self._tts_config.vits_weights_path
+
     def get_info(self) -> BackendInfo:
         return BackendInfo(
             name="GPT-SoVITS (PyTorch)",

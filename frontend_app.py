@@ -88,7 +88,7 @@ class FrontendApp:
                     fallback = self.directory / "200.html"
                     if fallback.is_file():
                         fallback_sent = True
-                        await FileResponse(fallback, media_type="text/html")(
+                        await FileResponse(fallback, media_type="text/html", headers={"Cache-Control": "no-cache"})(
                             scope, receive, send
                         )
                         return
@@ -103,6 +103,14 @@ class FrontendApp:
                         (b"content-type", _content_type_header(request_path).encode())
                     )
                     message = {**message, "headers": headers}
+                if status in (200, 206, 304) and (
+                    extension in (".js", ".mjs", ".html")
+                    or any(name.lower() == b"content-type" and value.startswith(b"text/html")
+                           for name, value in message["headers"])
+                ):
+                    headers = [(name, value) for name, value in message["headers"]
+                               if name.lower() != b"cache-control"]
+                    message = {**message, "headers": [*headers, (b"cache-control", b"no-cache")]}
 
             if not fallback_sent:
                 await send(message)

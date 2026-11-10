@@ -81,3 +81,7 @@ class BasePipeline(ABC):
 
     def stop(self) -> None:
         """Request cooperative cancellation of the active call, when supported."""
+
+    def get_model_paths(self) -> tuple[str, str]:
+        """Return the weights already loaded at engine startup."""
+        return "", ""

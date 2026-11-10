@@ -188,11 +188,7 @@ async def tts_task_audio(request: Request, task_id: int):
         return JSONResponse(status_code=404, content={"message": f"task {task_id} not found"})
 
     # 等待任务完成
-    timeout = 120.0
-    elapsed = 0.0
-    while not task.output.done and elapsed < timeout:
-        await task.output.wait_for_update(timeout=5.0)
-        elapsed += 5.0
+    await task.output.wait_until_done(timeout=120.0)
 
     if task.output.error:
         return JSONResponse(status_code=500, content={"message": task.output.error})

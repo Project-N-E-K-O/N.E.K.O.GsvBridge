@@ -177,6 +177,18 @@ Bridge 继续使用原有 `/api/v3/voices` 和 `/api/v3/tts/stream-input`，NEKO
 独立；未设置时保留原 `voices/default.toml` 行为。具体默认 ID、机器路径、用户音色 TOML、
 权重和参考音频均属于本机数据，不应加入 Git。公共示例和通用代码、测试才属于仓库交付。
 
+### 配置管理界面
+
+声音编辑页提供 `V5 Dev`、`V5 Turbo` 选项。切换版本会扫描并选择对应 GPT/SoVITS 权重，
+自动采样步数/CFG 显示当前模型的默认值；关闭自动后可以输入自定义值。
+CUDA Graph 和 FlashAttention 可以独立选择。保存并重新打开后保留版本、参考音频和参数选择。
+已有声音的显式参数继续保留，不会因升级或切换版本被默默重置。
+
+可编辑源码、构建方法和分发集成说明见 [`frontend/README.md`](frontend/README.md)。
+执行 `npm ci && npm run build` 重建编辑页，其余现有页面保持原有分发。
+构建使用内容哈希和 import map 更新路由，静态托管对 HTML/JS 要求重新验证缓存。
+更新正在运行的服务文件后需完整刷新浏览器页面；后端代码更新需重启 Bridge。
+
 ### NEKO 音频与任务生命周期
 
 - `stream-input` 固定输出独立的 **48 kHz / 单声道 / PCM16 WAV** 帧，每帧最多一秒音频。
@@ -190,6 +202,9 @@ Bridge 继续使用原有 `/api/v3/voices` 和 `/api/v3/tts/stream-input`，NEKO
   GSV 的停止检查位于宿主推理边界，不能立即抢占正在执行的 GPU kernel。
 - 流式任务完成/断连后释放任务和音频；REST 默认保留最近 100 个完成任务，较旧 ID 返回 404。
   模型切换使参考音频缓存失效，使用相同参考音频路径也会重新提取特征。
+- v2 推理和手动模型切换也进入同一 Worker 队列；手动选择的权重与 v3 当前模型独立维护。
+  v3 请求不会继承管理页面临时切换的模型，v2 也会恢复自己的选定权重。
+  下载完整音频使用真实截止时间，连续音频更新不会被误计为等待超时。
 
 本次兼容保持按文本段推理。`streaming_mode` / `return_fragment` 会传递给宿主，实际输出能力
 取决于宿主；仅新增参数不能恢复宿主缺失的 `gpt_streaming` 语义 token 流式。
@@ -205,6 +220,7 @@ python -m pytest tests -q
 ```
 
 默认测试使用临时目录、模拟后端和进程内 WebSocket，不需要本机音色、模型、GPU 或监听端口。
+编辑页还有 Node 状态测试和可选隔离浏览器验收，运行方法见 `frontend/README.md`。
 可选真实宿主测试通过 `GSV_TEST_HOST_ROOT` 指定宿主位置，使用仓库已有公共参考音频和临时
 推理配置，验证 V2ProPlus → Turbo → Dev → V2ProPlus 的协议与模型切换；不改写用户配置。
 
@@ -274,8 +290,8 @@ $env:GSV_TEST_HOST_ROOT = 'C:\path\to\GPT-SoVITS'
 
 ### 后端抽象（backends/base.py）
 
-所有后端实现统一的 `BasePipeline` 接口（`run`、`init_t2s_weights`、`init_vits_weights`、`get_info`、`validate_params`），`InferenceEngine` 据此统一调度，因此新增后端无需改动引擎与路由。
+所有后端实现统一的 `BasePipeline` 接口（`run`、`init_t2s_weights`、`init_vits_weights`、`get_info`、`validate_params`、`get_model_paths`、`stop`）。`get_model_paths` 告知引擎启动时已加载的权重，`stop` 提供协作停止；`InferenceEngine` 统一调度模型切换和推理。
 
 ### 前端托管
 
-`server.py` 将 `frontend/.output/public` 挂载为独立的前端应用。真实文件由 Starlette 的 `StaticFiles` 托管，只有构建产物未预渲染的 `/config/new` 和 `/config/{id}` 页面使用 Nuxt 的 `200.html`。缺失资源、未知页面和未知 `/api` 路径返回 404。资源 MIME 在 ASGI 响应头处固定，不依赖 Windows 注册表。若该目录不存在，启动时会打印警告，需先在 `frontend/` 下执行 `npx nuxt generate` 构建。
+`server.py` 将 `frontend/.output/public` 挂载为独立的前端应用。真实文件由 Starlette 的 `StaticFiles` 托管，只有构建产物未预渲染的 `/config/new` 和 `/config/{id}` 页面使用 Nuxt 的 `200.html`。缺失资源、未知页面和未知 `/api` 路径返回 404。资源 MIME 在 ASGI 响应头处固定，不依赖 Windows 注册表。声音编辑页可从仓库中的 Vue 源码重建，其他 Nuxt 页面继续使用仓库已有分发；不要删除分发目录后尝试仅凭编辑页源码重建整个应用。

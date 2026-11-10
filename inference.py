@@ -83,6 +83,17 @@ class OutputBuffer:
         except asyncio.TimeoutError:
             return False
 
+    async def wait_until_done(self, timeout: Optional[float] = 120.0) -> bool:
+        """Measure a real deadline, regardless of how often audio wakes us."""
+        async def wait():
+            while not self.done:
+                await self.wait_for_update()
+        try:
+            await asyncio.wait_for(wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
 
 @dataclass
 class InferTask:
@@ -99,6 +110,7 @@ class InferTask:
     media_type: str = "wav"
     pcm48_wav: bool = False
     retain_result: bool = True
+    model_only: bool = False
     cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
     release_when_done: bool = False
     # 输出缓冲区（自动创建）
@@ -131,8 +143,8 @@ class InferenceEngine:
         self._task_counter = 0
         self._counter_lock = threading.Lock()
 
-        self._current_gpt: str = ""
-        self._current_sovits: str = ""
+        self._manual_weights = tts_pipeline.get_model_paths()
+        self._current_gpt, self._current_sovits = self._manual_weights
 
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
@@ -181,6 +193,7 @@ class InferenceEngine:
         *,
         pcm48_wav: bool = False,
         retain_result: bool = True,
+        model_only: bool = False,
     ) -> InferTask:
         """提交推理任务，返回 InferTask（含 task_id 和 output buffer）"""
         task_id = self._next_id()
@@ -194,11 +207,29 @@ class InferenceEngine:
             media_type=media_type,
             pcm48_wav=pcm48_wav,
             retain_result=retain_result,
+            model_only=model_only,
         )
         self._tasks[task_id] = task
         self._prune_completed_tasks()
         await self._queue.put(task)
         return task
+
+    async def submit_selected(self, tts_params: dict, media_type: str = "wav") -> InferTask:
+        """Snapshot the manually selected pair so v3 requests cannot replace it."""
+        gpt, sovits = self._manual_weights
+        return await self.submit("_manual", gpt, sovits, tts_params,
+                                 media_type=media_type, retain_result=False)
+
+    async def select_model_weights(self, *, gpt: str = "", sovits: str = ""):
+        """Serialize manual model selection with every other pipeline operation."""
+        task = await self.submit("_manual", gpt, sovits, {}, model_only=True, retain_result=False)
+        try:
+            await task.output.wait_until_done(timeout=None)
+            if task.output.error:
+                raise ValueError(task.output.error)
+        finally:
+            self.cancel_task(task.task_id)
+            self.cleanup_task(task.task_id)
 
     def get_task(self, task_id: int) -> Optional[InferTask]:
         """获取任务"""
@@ -275,23 +306,30 @@ class InferenceEngine:
     async def _process_task(self, task: InferTask):
         """处理单个推理任务"""
         # 1. 模型切换（如果需要）
-        need_gpt = task.gpt_weights and task.gpt_weights != self._current_gpt
-        need_sovits = task.sovits_weights and task.sovits_weights != self._current_sovits
+        gpt, sovits = task.gpt_weights, task.sovits_weights
+        if task.model_only:
+            gpt = gpt or self._manual_weights[0]
+            sovits = sovits or self._manual_weights[1]
+        need_gpt = gpt and gpt != self._current_gpt
+        need_sovits = sovits and sovits != self._current_sovits
 
         if need_gpt or need_sovits:
             task.status = TaskStatus.LOADING_MODEL
             if need_sovits:
                 self._current_sovits = ""
-                await asyncio.to_thread(self._pipeline.init_vits_weights, task.sovits_weights)
-                self._current_sovits = task.sovits_weights
+                await asyncio.to_thread(self._pipeline.init_vits_weights, sovits)
+                self._current_sovits = sovits
             if task.cancelled.is_set():
                 return
             if need_gpt:
                 self._current_gpt = ""
-                await asyncio.to_thread(self._pipeline.init_t2s_weights, task.gpt_weights)
-                self._current_gpt = task.gpt_weights
+                await asyncio.to_thread(self._pipeline.init_t2s_weights, gpt)
+                self._current_gpt = gpt
 
         if task.cancelled.is_set():
+            return
+        if task.model_only:
+            self._manual_weights = gpt, sovits
             return
         error = self.validate_params({**task.tts_params, "media_type": task.media_type})
         if error:
