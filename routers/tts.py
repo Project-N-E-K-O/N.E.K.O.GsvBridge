@@ -6,14 +6,13 @@ GPT-SoVITS API v3 - TTS 推理路由
 """
 from __future__ import annotations
 
-from typing import Generator, Union
-from io import BytesIO
+from typing import Union
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-from api_neko.audio_utils import pack_audio, wave_header_chunk
+from api_neko.audio_utils import join_wav_chunks, wave_header_chunk
 
 
 router = APIRouter(prefix="/api/v2", tags=["tts"])
@@ -42,7 +41,10 @@ class TTS_Request(BaseModel):
     streaming_mode: Union[bool, int] = False
     parallel_infer: bool = True
     repetition_penalty: float = 1.35
-    sample_steps: int = 32
+    sample_steps: Union[int, None] = None
+    cfg_rate: Union[float, None] = None
+    use_cuda_graph: bool = True
+    use_flash_attention: bool = True
     super_sampling: bool = False
     overlap_length: int = 2
     min_chunk_length: int = 16
@@ -50,28 +52,24 @@ class TTS_Request(BaseModel):
 
 # ─── 工具函数 ───
 
-def _get_pipeline(request: Request):
-    """从 app.state 获取 TTS pipeline"""
-    return request.app.state.tts_pipeline
+def _get_engine(request: Request):
+    return request.app.state.inference_engine
 
 
-def check_params(req: dict, pipeline) -> JSONResponse | None:
-    """校验 TTS 请求参数，委托给 pipeline 后端"""
-    err = pipeline.validate_params(req)
-    if err:
-        return JSONResponse(status_code=400, content={"message": err})
-    return None
+def _task_error_response(task):
+    if task.output.validation_error:
+        return JSONResponse(status_code=400, content={"message": task.output.validation_error})
+    return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": task.output.error})
 
 
-async def tts_handle(req: dict, tts_pipeline):
+async def tts_handle(req: dict, engine):
     """TTS 推理核心处理函数"""
     streaming_mode = req.get("streaming_mode", False)
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
-
-    check_res = check_params(req, tts_pipeline)
-    if check_res is not None:
-        return check_res
+    error = engine.validate_request(req)
+    if error:
+        return JSONResponse(status_code=400, content={"message": error})
 
     if streaming_mode == 0:
         streaming_mode = False
@@ -99,35 +97,52 @@ async def tts_handle(req: dict, tts_pipeline):
     req["return_fragment"] = return_fragment
     req["fixed_length_chunk"] = fixed_length_chunk
 
-    print(f"{streaming_mode} {return_fragment} {fixed_length_chunk}")
-
     streaming_mode = streaming_mode or return_fragment
-
+    task = None
+    response_owns_task = False
     try:
-        tts_generator = tts_pipeline.run(req)
-
+        # Resolve the manual selection in queue order, independently of v3 voices.
+        task = await engine.submit_selected(req, "raw" if streaming_mode and media_type == "wav" else media_type)
         if streaming_mode:
-
-            def streaming_generator(tts_generator: Generator, media_type: str):
-                if_first_chunk = True
-                for sr, chunk in tts_generator:
-                    if if_first_chunk and media_type == "wav":
-                        yield wave_header_chunk(sample_rate=sr)
-                        media_type = "raw"
-                        if_first_chunk = False
-                    yield pack_audio(BytesIO(), chunk, sr, media_type).getvalue()
-
+            while not task.output.done and not task.output.chunks:
+                await task.output.wait_for_update()
+            if task.output.error and not task.output.chunks:
+                return _task_error_response(task)
+            async def streaming_generator():
+                index = 0
+                try:
+                    while not task.output.done or index < len(task.output.chunks):
+                        while index < len(task.output.chunks):
+                            chunk = task.output.chunks[index]
+                            if index == 0 and media_type == "wav":
+                                yield wave_header_chunk(sample_rate=chunk.sample_rate)
+                            yield chunk.data
+                            index += 1
+                        if not task.output.done:
+                            await task.output.wait_for_update()
+                    if task.output.error:
+                        raise RuntimeError(task.output.error)
+                finally:
+                    engine.cancel_task(task.task_id)
+                    engine.cleanup_task(task.task_id)
+            response_owns_task = True
             return StreamingResponse(
-                streaming_generator(tts_generator, media_type),
+                streaming_generator(),
                 media_type=f"audio/{media_type}",
             )
-
-        else:
-            sr, audio_data = next(tts_generator)
-            audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
-            return Response(audio_data, media_type=f"audio/{media_type}")
+        # Legacy v2 waits through queueing and synthesis without a server deadline.
+        await task.output.wait_until_done(timeout=None)
+        if task.output.error:
+            return _task_error_response(task)
+        chunks = [chunk.data for chunk in task.output.chunks]
+        audio_data = join_wav_chunks(chunks) if media_type == "wav" else b"".join(chunks)
+        return Response(audio_data, media_type=f"audio/{media_type}")
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": str(e)})
+    finally:
+        if task is not None and not response_owns_task:
+            engine.cancel_task(task.task_id)
+            engine.cleanup_task(task.task_id)
 
 
 # ─── TTS 端点 ───
@@ -154,7 +169,10 @@ async def tts_get_endpoint(
     media_type: str = "wav",
     parallel_infer: bool = True,
     repetition_penalty: float = 1.35,
-    sample_steps: int = 32,
+    sample_steps: Union[int, None] = None,
+    cfg_rate: Union[float, None] = None,
+    use_cuda_graph: bool = True,
+    use_flash_attention: bool = True,
     super_sampling: bool = False,
     streaming_mode: Union[bool, int] = False,
     overlap_length: int = 2,
@@ -181,18 +199,21 @@ async def tts_get_endpoint(
         "streaming_mode": streaming_mode,
         "parallel_infer": parallel_infer,
         "repetition_penalty": float(repetition_penalty),
-        "sample_steps": int(sample_steps),
+        "sample_steps": sample_steps,
+        "cfg_rate": cfg_rate,
+        "use_cuda_graph": use_cuda_graph,
+        "use_flash_attention": use_flash_attention,
         "super_sampling": super_sampling,
         "overlap_length": int(overlap_length),
         "min_chunk_length": int(min_chunk_length),
     }
-    return await tts_handle(req, _get_pipeline(request))
+    return await tts_handle(req, _get_engine(request))
 
 
 @router.post("/tts", summary="TTS 推理 (POST)")
 async def tts_post_endpoint(request: Request, body: TTS_Request):
-    req = body.dict()
-    return await tts_handle(req, _get_pipeline(request))
+    req = body.model_dump()
+    return await tts_handle(req, _get_engine(request))
 
 
 # ─── 模型切换端点 ───
@@ -202,7 +223,7 @@ async def set_gpt_weights(request: Request, weights_path: str = None):
     try:
         if weights_path in ["", None]:
             return JSONResponse(status_code=400, content={"message": "gpt weight path is required"})
-        _get_pipeline(request).init_t2s_weights(weights_path)
+        await _get_engine(request).select_model_weights(gpt=weights_path)
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": "change gpt weight failed", "Exception": str(e)})
     return JSONResponse(status_code=200, content={"message": "success"})
@@ -213,7 +234,7 @@ async def set_sovits_weights(request: Request, weights_path: str = None):
     try:
         if weights_path in ["", None]:
             return JSONResponse(status_code=400, content={"message": "sovits weight path is required"})
-        _get_pipeline(request).init_vits_weights(weights_path)
+        await _get_engine(request).select_model_weights(sovits=weights_path)
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": "change sovits weight failed", "Exception": str(e)})
     return JSONResponse(status_code=200, content={"message": "success"})

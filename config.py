@@ -91,7 +91,11 @@ class InferParams:
     parallel_infer: bool = True
     speed_factor: float = 1.0
     fragment_interval: float = 0.3
-    sample_steps: int = 32
+    # None leaves the model-specific default to the host (Turbo: 4, Dev: 32).
+    sample_steps: Optional[int] = None
+    cfg_rate: Optional[float] = None
+    use_cuda_graph: bool = True
+    use_flash_attention: bool = True
     super_sampling: bool = False
     streaming_mode: bool = False
     return_fragment: bool = False
@@ -120,34 +124,20 @@ class VoiceConfig:
         将配置转换为 TTS.run() 所需的 inputs dict。
         overrides 中的参数会覆盖配置文件中的默认值。
         """
+        params = asdict(self.params)
+        params.update({
+            key: value for key, value in overrides.items()
+            if key in params and (value is not None or key in ("sample_steps", "cfg_rate"))
+        })
         inputs = {
+            **params,
             "text": text,
-            "text_lang": overrides.get("text_lang", self.params.text_lang),
             "ref_audio_path": self._resolve_path(self.ref_audio.path),
             "aux_ref_audio_paths": [
                 self._resolve_path(p) for p in self.ref_audio.aux_ref_audio_paths
             ],
             "prompt_text": overrides.get("prompt_text", self.ref_audio.prompt_text),
             "prompt_lang": overrides.get("prompt_lang", self.ref_audio.prompt_lang),
-            "top_k": overrides.get("top_k", self.params.top_k),
-            "top_p": overrides.get("top_p", self.params.top_p),
-            "temperature": overrides.get("temperature", self.params.temperature),
-            "text_split_method": overrides.get("text_split_method", self.params.text_split_method),
-            "batch_size": overrides.get("batch_size", self.params.batch_size),
-            "batch_threshold": overrides.get("batch_threshold", self.params.batch_threshold),
-            "speed_factor": overrides.get("speed_factor", self.params.speed_factor),
-            "split_bucket": overrides.get("split_bucket", self.params.split_bucket),
-            "return_fragment": overrides.get("return_fragment", self.params.return_fragment),
-            "fragment_interval": overrides.get("fragment_interval", self.params.fragment_interval),
-            "seed": overrides.get("seed", self.params.seed),
-            "parallel_infer": overrides.get("parallel_infer", self.params.parallel_infer),
-            "repetition_penalty": overrides.get("repetition_penalty", self.params.repetition_penalty),
-            "sample_steps": overrides.get("sample_steps", self.params.sample_steps),
-            "super_sampling": overrides.get("super_sampling", self.params.super_sampling),
-            "streaming_mode": overrides.get("streaming_mode", self.params.streaming_mode),
-            "overlap_length": overrides.get("overlap_length", self.params.overlap_length),
-            "min_chunk_length": overrides.get("min_chunk_length", self.params.min_chunk_length),
-            "fixed_length_chunk": overrides.get("fixed_length_chunk", self.params.fixed_length_chunk),
         }
         return inputs
 
@@ -217,7 +207,8 @@ def _dict_to_voice_config(data: dict) -> VoiceConfig:
         p = data["params"]
         defaults = InferParams()
         cfg.params = InferParams(**{
-            k: p.get(k, getattr(defaults, k))
+            k: None if k in ("sample_steps", "cfg_rate") and p.get(k) == "auto"
+            else p.get(k, getattr(defaults, k))
             for k in defaults.__dataclass_fields__
         })
 
@@ -256,6 +247,16 @@ def reload_default_config():
 def load_default_config() -> VoiceConfig:
     """加载默认配置"""
     return _dict_to_voice_config(_get_default_data())
+
+
+def load_tts_voice(voice_id: str) -> VoiceConfig:
+    """Resolve the request default without changing shared voice defaults."""
+    if voice_id == "_default":
+        default_id = str(load_settings().get("default_voice_id") or "").strip()
+        if not default_id or default_id == "_default":
+            return load_default_config()
+        voice_id = default_id
+    return load_voice(voice_id)
 
 
 async def aload_default_config() -> VoiceConfig:
@@ -305,7 +306,6 @@ def save_voice(config: VoiceConfig, path: Optional[str | Path] = None) -> Path:
         path = VOICES_DIR / f"{config.voice.id}.toml"
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    print(config.ref_audio)
     data = {
         "voice": asdict(config.voice),
         "model": asdict(config.model),
@@ -313,6 +313,11 @@ def save_voice(config: VoiceConfig, path: Optional[str | Path] = None) -> Path:
         "params": asdict(config.params),
         "output": asdict(config.output),
     }
+    # Explicit auto overrides numeric values inherited from default.toml. Older
+    # files with omitted keys keep their existing shared-default inheritance.
+    for key in ("sample_steps", "cfg_rate"):
+        if data["params"][key] is None:
+            data["params"][key] = "auto"
 
     a = str(Path(config.ref_audio.path))
     b = str(Path(config.model.gpt_weights))

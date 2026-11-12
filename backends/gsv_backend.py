@@ -15,6 +15,12 @@ from .base import BasePipeline, BackendInfo
 logger = logging.getLogger(__name__)
 
 
+def sovits_model_version(path: str) -> str:
+    """Reuse the host's base-model hashes and fine-tuned weight headers."""
+    from GPT_SoVITS.process_ckpt import get_sovits_version_from_path_fast
+    return get_sovits_version_from_path_fast(path)[1]
+
+
 class GSVPipeline(BasePipeline):
     """GPT-SoVITS 原项目 PyTorch 推理后端"""
 
@@ -57,6 +63,16 @@ class GSVPipeline(BasePipeline):
     def init_vits_weights(self, path: str) -> None:
         logger.info(f"[GSV Backend] 加载 SoVITS 权重: {path}")
         self._tts.init_vits_weights(path)
+        # Reference semantic codes/specs belong to the loaded SoVITS model.
+        # The same audio path must be re-encoded after changing weights.
+        self._tts.prompt_cache["ref_audio_path"] = None
+        self._tts.prompt_cache["prompt_text"] = None
+
+    def stop(self) -> None:
+        self._tts.stop()
+
+    def get_model_paths(self) -> tuple[str, str]:
+        return self._tts_config.t2s_weights_path, self._tts_config.vits_weights_path
 
     def get_info(self) -> BackendInfo:
         return BackendInfo(
@@ -66,29 +82,36 @@ class GSVPipeline(BasePipeline):
             supports_streaming=True,
         )
 
-    def validate_params(self, req: dict) -> Optional[str]:
-        """使用原项目的校验逻辑"""
-        text = req.get("text", "")
-        text_lang = req.get("text_lang", "")
-        ref_audio_path = req.get("ref_audio_path", "")
-        prompt_lang = req.get("prompt_lang", "")
-        media_type = req.get("media_type", "wav")
+    def validate_request(self, req: dict) -> Optional[str]:
+        error = super().validate_request(req)
+        if error:
+            return error
         text_split_method = req.get("text_split_method", "cut5")
-
-        if not ref_audio_path:
-            return "ref_audio_path is required"
-        if not text:
-            return "text is required"
-        if not text_lang:
-            return "text_lang is required"
-        if text_lang.lower() not in self._tts_config.languages:
-            return f"text_lang: {text_lang} is not supported in version {self._tts_config.version}"
-        if not prompt_lang:
-            return "prompt_lang is required"
-        if prompt_lang.lower() not in self._tts_config.languages:
-            return f"prompt_lang: {prompt_lang} is not supported in version {self._tts_config.version}"
-        if media_type not in ("wav", "raw", "ogg", "aac"):
-            return f"media_type: {media_type} is not supported"
+        if req.get("sample_steps") is not None and req["sample_steps"] < 1:
+            return "sample_steps must be positive"
+        if req.get("cfg_rate") is not None and req["cfg_rate"] < 0:
+            return "cfg_rate must be non-negative"
         if text_split_method not in self._cut_method_names:
             return f"text_split_method: {text_split_method} is not supported"
+        return None
+
+    def validate_params(self, req: dict) -> Optional[str]:
+        """Check languages and reference text against the target model."""
+        error = self.validate_request(req)
+        if error:
+            return error
+        text_lang = req.get("text_lang", "")
+        prompt_lang = req.get("prompt_lang", "")
+        version = req.get("model_version", self._tts_config.version)
+        languages = self._tts_config.v1_languages if version == "v1" else self._tts_config.v2_languages
+        if version in ("v3", "v4", "v5dev", "v5turbo") and not req.get("prompt_text", "").strip():
+            return "prompt_text is required for V3/V4/V5"
+        if not text_lang:
+            return "text_lang is required"
+        if text_lang.lower() not in languages:
+            return f"text_lang: {text_lang} is not supported in version {version}"
+        if not prompt_lang:
+            return "prompt_lang is required"
+        if prompt_lang.lower() not in languages:
+            return f"prompt_lang: {prompt_lang} is not supported in version {version}"
         return None

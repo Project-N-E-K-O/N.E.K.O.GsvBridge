@@ -197,6 +197,12 @@ class GeniePipeline(BasePipeline):
         """Genie 不分开加载 T2S 权重，忽略"""
         logger.debug(f"[Genie Backend] init_t2s_weights 被调用但 Genie 不需要单独加载 T2S: {path}")
 
+    def stop(self) -> None:
+        self._tts_client.stop_event.set()
+
+    def get_model_paths(self) -> tuple[str, str]:
+        return "", self._current_model_dir
+
     def init_vits_weights(self, path: str) -> None:
         """加载 ONNX 模型目录
 
@@ -233,19 +239,12 @@ class GeniePipeline(BasePipeline):
 
     def validate_params(self, req: dict) -> Optional[str]:
         """校验推理参数"""
-        text = req.get("text", "")
+        error = self.validate_request(req)
+        if error:
+            return error
         text_lang = req.get("text_lang", "")
-        ref_audio_path = req.get("ref_audio_path", "")
-        media_type = req.get("media_type", "wav")
-
-        if not ref_audio_path:
-            return "ref_audio_path is required"
-        if not text:
-            return "text is required"
         if not text_lang:
             return "text_lang is required"
         if text_lang.lower() not in _LANG_MAP:
             return f"text_lang: {text_lang} is not supported by Genie backend"
-        if media_type not in ("wav", "raw", "ogg", "aac"):
-            return f"media_type: {media_type} is not supported"
         return None

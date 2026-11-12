@@ -1,0 +1,13 @@
+{
+  "name": "gsvbridge-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@vue/compiler-sfc": "3.5.13",
+    "esbuild": "0.25.12"
+  }
+}

@@ -76,7 +76,10 @@ class InferParamsResponse(BaseModel):
     parallel_infer: bool
     speed_factor: float
     fragment_interval: float
-    sample_steps: int
+    sample_steps: Optional[int] = None
+    cfg_rate: Optional[float] = None
+    use_cuda_graph: bool = True
+    use_flash_attention: bool = True
     super_sampling: bool
     streaming_mode: bool
     return_fragment: bool
@@ -214,7 +217,13 @@ async def api_update_voice(voice_id: str, body: VoiceConfigRequest):
     if existing is None:
         raise HTTPException(status_code=404, detail=f"声音 {voice_id!r} 不存在")
 
-    cfg = _dict_to_voice_config(body.model_dump())
+    data = body.model_dump()
+    # Older clients do not render the new controls; an unrelated save must not reset them.
+    previous = await aload_voice(voice_id)
+    for name in ("sample_steps", "cfg_rate", "use_cuda_graph", "use_flash_attention"):
+        if name not in body.params.model_fields_set:
+            data["params"][name] = getattr(previous.params, name)
+    cfg = _dict_to_voice_config(data)
     # 确保 voice.id 与路径参数一致
     cfg.voice.id = voice_id
     try:
@@ -265,6 +274,8 @@ _GPT_WEIGHT_ROOTS = {
     "v2": "GPT_weights_v2",
     "v3": "GPT_weights_v3",
     "v4": "GPT_weights_v4",
+    "v5dev": "GPT_weights_v5dev",
+    "v5turbo": "GPT_weights_v5turbo",
     "v2Pro": "GPT_weights_v2Pro",
     "v2ProPlus": "GPT_weights_v2ProPlus",
 }
@@ -273,6 +284,8 @@ _SOVITS_WEIGHT_ROOTS = {
     "v2": "SoVITS_weights_v2",
     "v3": "SoVITS_weights_v3",
     "v4": "SoVITS_weights_v4",
+    "v5dev": "SoVITS_weights_v5dev",
+    "v5turbo": "SoVITS_weights_v5turbo",
     "v2Pro": "SoVITS_weights_v2Pro",
     "v2ProPlus": "SoVITS_weights_v2ProPlus",
 }
@@ -284,6 +297,13 @@ _PRETRAINED_DIR = "GPT_SoVITS/pretrained_models"
 # 推理时不需要的文件名模式（鉴别器、vocoder 等）
 _NON_INFERENCE_PREFIXES = ("s2D",)
 _NON_INFERENCE_NAMES = {"vocoder.pth"}
+
+# GPT bases follow the host's pretrained_gpt_name, not the SoVITS version.
+_PRETRAINED_GPT_VERSIONS = {
+    "s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt": ("v1",),
+    "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt": ("v2",),
+    "s1v3.ckpt": ("v3", "v4", "v2Pro", "v2ProPlus", "v5dev", "v5turbo"),
+}
 
 
 def _scan_weights(
@@ -311,6 +331,12 @@ def _scan_weights(
                 continue
             if any(f.name.startswith(p) for p in _NON_INFERENCE_PREFIXES):
                 continue
+            if version:
+                if extensions == {".ckpt"} and f.name in _PRETRAINED_GPT_VERSIONS:
+                    if version not in _PRETRAINED_GPT_VERSIONS[f.name]:
+                        continue
+                elif _infer_pretrained_version(f) != version:
+                    continue
             rel = str(f.relative_to(_PROJECT_ROOT))
             if rel not in results:
                 results.append(rel)
@@ -468,12 +494,26 @@ _PRETRAINED_SUBDIR_VERSION = {
 
 def _infer_pretrained_version(filepath: Path) -> str:
     """根据文件所在子目录或文件名推断 pretrained 模型的版本"""
+    if filepath.name in _PRETRAINED_GPT_VERSIONS:
+        return _PRETRAINED_GPT_VERSIONS[filepath.name][0]
+    if filepath.suffix.lower() == ".pth":
+        from api_neko.backends.gsv_backend import sovits_model_version
+        try:
+            return sovits_model_version(str(filepath))
+        except (ImportError, KeyError, ValueError):
+            # A standalone Bridge checkout may not have the host installed. Keep
+            # filename discovery available there; inference still validates weights.
+            pass
     # 先看子目录名
     parent_name = filepath.parent.name
     if parent_name in _PRETRAINED_SUBDIR_VERSION:
         return _PRETRAINED_SUBDIR_VERSION[parent_name]
     # 根目录下按文件名判断
     name = filepath.stem.lower()
+    if "v5turbo" in name:
+        return "v5turbo"
+    if "v5dev" in name:
+        return "v5dev"
     if "v4" in name:
         return "v4"
     if "v3" in name:
@@ -611,15 +651,20 @@ def _scan_gsv_models() -> list[dict]:
     for version, sv_list in sovits_files.items():
         for sv in sv_list:
             if (version, sv["character"]) not in gpt_chars:
+                # Use the host's compatible GPT base. Prefer a
+                # same-character fine-tuned GPT above; only fill the unpaired case.
+                shared_gpt = next((g for group in gpt_files.values() for g in group
+                                   if g["pretrained"] and version in
+                                   _PRETRAINED_GPT_VERSIONS.get(g["filename"], ())), None)
                 models.append(
                     {
                         "type": "pytorch",
                         "pretrained": sv.get("pretrained", False),
                         "version": version,
                         "character": sv["character"],
-                        "total_size_bytes": sv["size_bytes"],
+                        "total_size_bytes": sv["size_bytes"] + (shared_gpt["size_bytes"] if shared_gpt else 0),
                         "modified": sv["modified"],
-                        "gpt": None,
+                        "gpt": shared_gpt,
                         "sovits": sv,
                     }
                 )
@@ -873,7 +918,6 @@ def _run_convert(task: _ConvertTask):
 
         # 绕过 genie_tts/__init__.py 的完整导入链（会触发交互式 input 和资源检查）
         # 只需要 Converter 子包，不需要完整运行时
-        import types
         import builtins
 
         # 1. 创建占位 GenieData 目录（避免 Resources.py 的 input() 阻塞）

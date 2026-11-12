@@ -1,0 +1,28 @@
+// Share the Vue instance already running the distributed Nuxt application.
+// These are the exports used by the original config-page chunk in this build.
+export {
+  f as defineComponent,
+  c as createElementBlock,
+  F as Fragment,
+  k as renderList,
+  o as openBlock,
+  n as normalizeClass,
+  t as toDisplayString,
+  a as createElementVNode,
+  g as onMounted,
+  i as unref,
+  q as createCommentVNode,
+  h as withDirectives,
+  l as vModelText,
+  v as vModelSelect,
+  b as createVNode,
+  w as withCtx,
+  x as createBlock,
+  d as createTextVNode,
+  j as isRef,
+  s as computed,
+  r as ref,
+  D as useRoute,
+  E as useRouter,
+  y as useI18n,
+} from './CyWKjLMZ.js';

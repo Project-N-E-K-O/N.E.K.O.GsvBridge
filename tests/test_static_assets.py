@@ -1,0 +1,141 @@
+import mimetypes
+import hashlib
+import json
+import re
+import tempfile
+from pathlib import Path
+from unittest import TestCase
+
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+from api_neko.frontend_app import FRONTEND_MEDIA_TYPES, FrontendApp, frontend_media_type
+
+
+class StaticAssetTests(TestCase):
+    def test_distributed_voice_editor_matches_source_and_every_html_entry(self):
+        frontend = Path(__file__).resolve().parents[1] / "frontend"
+        public = frontend / ".output/public"
+        manifest = json.loads((public / "_nuxt/voice-editor-manifest.json").read_text(encoding="utf-8"))
+        content = (public / "_nuxt" / manifest["entry"]).read_text(encoding="utf-8")
+        fingerprint = hashlib.sha256(content.encode()).hexdigest()[:12]
+        self.assertEqual(manifest["entry"], f"voice-editor.{fingerprint}.js")
+        source = hashlib.sha256()
+        for name in manifest["inputs"]:
+            source.update((frontend / name).read_text(encoding="utf-8").encode())
+        self.assertEqual(source.hexdigest(), manifest["sourceSHA256"])
+        self.assertIn("v5dev", content)
+        self.assertIn("v5turbo", content)
+        for html in public.rglob("*.html"):
+            with self.subTest(page=html.relative_to(public)):
+                found = re.search(r'<script type="importmap" data-gsv-voice-editor>(.*?)</script>', html.read_text(encoding="utf-8"))
+                self.assertIsNotNone(found)
+                mapping = json.loads(found.group(1))["imports"]
+                self.assertEqual(mapping["/_nuxt/" + manifest["legacyRoute"]], "/_nuxt/" + manifest["entry"])
+
+    def test_frontend_media_types_are_explicit(self):
+        for suffix, media_type in FRONTEND_MEDIA_TYPES.items():
+            with self.subTest(suffix=suffix):
+                self.assertEqual(frontend_media_type("asset" + suffix), media_type)
+
+    def test_unknown_media_types_use_registry_independent_standard_table(self):
+        self.assertEqual(frontend_media_type("image.svg"), "image/svg+xml")
+        self.assertEqual(frontend_media_type("font.woff2"), "font/woff2")
+        self.assertEqual(frontend_media_type("unknown.nekoasset"), "application/octet-stream")
+
+    def test_static_mount_serves_assets_and_client_routes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "app.js").write_text("console.log('ok');", encoding="utf-8")
+            (root / "index.html").write_text("<h1>root</h1>", encoding="utf-8")
+            (root / "200.html").write_text("<h1>spa</h1>", encoding="utf-8")
+            (root / "404.html").write_text("<h1>not found</h1>", encoding="utf-8")
+            (root / "manifest.json").write_text('{"id":"test"}', encoding="utf-8")
+
+            app = Starlette(
+                routes=[
+                    Route("/api/v3/health", lambda request: JSONResponse({"ok": True}))
+                ]
+            )
+            app.mount("/", FrontendApp(directory=root), name="frontend")
+            with TestClient(app, raise_server_exceptions=False) as client:
+                self.assertEqual(
+                    client.get("/app.js").headers["content-type"],
+                    "text/javascript; charset=utf-8",
+                )
+                self.assertEqual(
+                    client.get("/manifest.json").headers["content-type"],
+                    "application/json",
+                )
+                self.assertEqual(client.get("/api/v3/health").status_code, 200)
+                self.assertNotIn("cache-control", client.get("/app.js").headers)
+                self.assertEqual(client.get("/").headers["cache-control"], "no-cache")
+                self.assertEqual(client.get("/config/new").headers["cache-control"], "no-cache")
+                self.assertEqual(client.get("/config/new").status_code, 200)
+                self.assertEqual(client.get("/config/example").status_code, 200)
+                for voice_id in ("speaker.v5", "speaker.with.dots"):
+                    response = client.get(f"/config/{voice_id}")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.text, "<h1>spa</h1>")
+                    self.assertIn("text/html", response.headers["content-type"])
+                self.assertEqual(client.get("/unknown-page").status_code, 404)
+                self.assertEqual(client.get("/missing.js").status_code, 404)
+                self.assertEqual(client.get("/favicon.ico").status_code, 404)
+                self.assertEqual(client.get("/api/v3/unknown").status_code, 404)
+                self.assertEqual(client.get("/api/unknown").status_code, 404)
+                for path in ("/..%2Fserver.py", "/%2e%2e/server.py", "/a%00b"):
+                    with self.subTest(path=path):
+                        self.assertEqual(client.get(path).status_code, 404)
+
+    def test_html_revalidates_but_hashed_assets_keep_normal_conditional_caching(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "index.html").write_text("<h1>root</h1>", encoding="utf-8")
+            for page in ("tts", "config", "models"):
+                (root / page).mkdir()
+                (root / page / "index.html").write_text(f"<h1>{page}</h1>", encoding="utf-8")
+            (root / "asset.abc123.js").write_text("const data = '" + "0123456789" * 30 + "';", encoding="utf-8")
+            app = Starlette()
+            app.mount("/", FrontendApp(root))
+            with TestClient(app) as client:
+                for path in ("/tts", "/config", "/models"):
+                    response = client.get(path, follow_redirects=False)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
+                    self.assertEqual(response.headers["cache-control"], "no-cache")
+                    self.assertNotIn("location", response.headers)
+                asset = client.get("/asset.abc123.js")
+                self.assertNotIn("cache-control", asset.headers)
+                conditional = client.get("/asset.abc123.js", headers={"If-None-Match": asset.headers["etag"]})
+                self.assertEqual(conditional.status_code, 304)
+                multipart = client.get("/asset.abc123.js", headers={"Range": "bytes=0-3,100-103"})
+                self.assertEqual(multipart.status_code, 206)
+                self.assertTrue(multipart.headers["content-type"].startswith("multipart/byteranges; boundary="))
+                boundary = multipart.headers["content-type"].split("boundary=", 1)[1].strip('"')
+                self.assertIn(boundary.encode(), multipart.content)
+                self.assertIn(b"Content-Range: bytes 0-3/", multipart.content)
+                single = client.get("/asset.abc123.js", headers={"Range": "bytes=0-3"})
+                self.assertEqual(single.status_code, 206)
+                self.assertEqual(single.headers["content-type"], "text/javascript; charset=utf-8")
+
+    def test_static_response_is_not_affected_by_global_registry_mapping(self):
+        previous = mimetypes.types_map.get(".js")
+        mimetypes.types_map[".js"] = "text/plain"
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "app.js").write_text("console.log('ok');", encoding="utf-8")
+                app = Starlette()
+                app.mount("/", FrontendApp(directory=root), name="frontend")
+                with TestClient(app) as client:
+                    self.assertEqual(
+                        client.get("/app.js").headers["content-type"],
+                        "text/javascript; charset=utf-8",
+                    )
+        finally:
+            if previous is None:
+                mimetypes.types_map.pop(".js", None)
+            else:
+                mimetypes.types_map[".js"] = previous
